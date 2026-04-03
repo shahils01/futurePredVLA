@@ -37,9 +37,10 @@ from model import FuturePredVLA, ModelConfig
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_type", type=str, default="droid_manifest", choices=["droid_manifest"])
+    parser.add_argument("--dataset_type", type=str, default="droid_manifest", choices=["droid_manifest", "droid_rlds"])
     parser.add_argument("--annotation_path", type=str, default="")
     parser.add_argument("--media_root", type=str, default="")
+    parser.add_argument("--data_root", type=str, default="")
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="validation")
     parser.add_argument("--val_ratio", type=float, default=0.01)
@@ -51,6 +52,13 @@ def parse_args():
     parser.add_argument("--future_video_frames", type=int, default=4)
     parser.add_argument("--chunk_horizon", type=int, default=16)
     parser.add_argument("--action_dim", type=int, default=7)
+    parser.add_argument("--current_history", type=int, default=4)
+    parser.add_argument("--future_offset", type=int, default=8)
+    parser.add_argument("--future_span", type=int, default=4)
+    parser.add_argument("--rlds_split", type=str, default="train")
+    parser.add_argument("--rlds_dataset_name", type=str, default="r2d2_faceblur")
+    parser.add_argument("--image_key", type=str, default="wrist_image_left")
+    parser.add_argument("--future_image_key", type=str, default="wrist_image_left")
 
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--fsdp", action="store_true")

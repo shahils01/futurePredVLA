@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -138,6 +138,23 @@ def _get_first(record, keys, default=None):
 def _load_image(path: str) -> Image.Image:
     with Image.open(path) as handle:
         return handle.convert("RGB")
+
+
+def _to_text(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _np_image_to_pil(value) -> Image.Image:
+    array = np.asarray(value)
+    if array.ndim != 3:
+        raise RuntimeError(f"Expected HWC image array, got shape {tuple(array.shape)}")
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return Image.fromarray(array).convert("RGB")
 
 
 def _resolve_frame_paths(root: str, value):
@@ -329,6 +346,117 @@ class DroidManifestDataset(Dataset):
         }
 
 
+class DroidRLDSDataset(IterableDataset):
+    def __init__(self, processor, args, split_name: str, is_train: bool):
+        self.processor = processor
+        self.args = args
+        self.split_name = split_name
+        self.is_train = is_train
+
+    def _episode_iter(self):
+        try:
+            import tensorflow_datasets as tfds
+        except Exception as exc:
+            raise RuntimeError(
+                "dataset_type=droid_rlds requires tensorflow-datasets. Install `tensorflow-datasets` and TensorFlow."
+            ) from exc
+
+        root = self.args.data_root or self.args.media_root or self.args.annotation_path
+        if not root:
+            raise RuntimeError("droid_rlds requires --data_root pointing to the local TFDS directory.")
+        version_dir = root
+        if os.path.isdir(os.path.join(root, "1.0.0")):
+            version_dir = os.path.join(root, "1.0.0")
+        builder = tfds.builder_from_directory(version_dir)
+        dataset = builder.as_dataset(split=self.args.rlds_split)
+        return tfds.as_numpy(dataset)
+
+    def __iter__(self):
+        rank, world_size = _build_distributed_rank_info()
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        shard_index = rank * num_workers + worker_id
+        shard_count = world_size * num_workers
+
+        emitted = 0
+        for episode_idx, episode in enumerate(self._episode_iter()):
+            if shard_count > 1 and episode_idx % shard_count != shard_index:
+                continue
+
+            steps = list(episode.get("steps", []))
+            total_steps = len(steps)
+            max_start = total_steps - int(self.args.chunk_horizon) - int(self.args.future_offset)
+            if max_start <= 0:
+                continue
+
+            file_path = _to_text(episode.get("episode_metadata", {}).get("file_path", f"episode_{episode_idx}"))
+            task_name = os.path.basename(os.path.dirname(file_path)) or self.args.rlds_dataset_name
+
+            for step_idx in range(max_start):
+                sample_id = f"{file_path}:{step_idx}"
+                fold = _stable_fold(sample_id, self.args.seed)
+                in_val = fold < max(0.0, min(0.5, float(self.args.val_ratio)))
+                keep = (not in_val) if self.is_train else in_val
+                if self.args.val_ratio == 0:
+                    keep = True if self.is_train else False
+                if not keep:
+                    continue
+                if self.args.max_samples_per_split > 0 and emitted >= int(self.args.max_samples_per_split):
+                    return
+
+                current_start = max(0, step_idx - int(self.args.current_history) + 1)
+                current_indices = np.linspace(
+                    current_start,
+                    step_idx,
+                    num=int(self.args.video_frames),
+                    dtype=np.int64,
+                )
+                future_begin = step_idx + int(self.args.future_offset)
+                future_end = min(total_steps - 1, future_begin + int(self.args.future_span) - 1)
+                future_indices = np.linspace(
+                    future_begin,
+                    future_end,
+                    num=int(self.args.future_video_frames),
+                    dtype=np.int64,
+                )
+
+                current_frames = [
+                    _np_image_to_pil(steps[int(idx)]["observation"][self.args.image_key])
+                    for idx in current_indices
+                ]
+                future_frames = [
+                    _np_image_to_pil(steps[int(idx)]["observation"][self.args.future_image_key])
+                    for idx in future_indices
+                ]
+
+                instruction = ""
+                for key in ("language_instruction", "language_instruction_2", "language_instruction_3"):
+                    instruction = _to_text(steps[step_idx].get(key))
+                    if instruction:
+                        break
+                if not instruction:
+                    instruction = "What action should the robot take next?"
+
+                actions = np.stack(
+                    [np.asarray(steps[idx]["action"], dtype=np.float32) for idx in range(step_idx, step_idx + int(self.args.chunk_horizon))],
+                    axis=0,
+                )
+                actions = torch.tensor(actions, dtype=torch.float32)
+
+                current_inputs = build_prompt_only_example(self.processor, current_frames, instruction)
+                future_inputs = build_prompt_only_example(self.processor, future_frames, instruction)
+                emitted += 1
+                yield {
+                    "id": sample_id,
+                    "task_name": task_name,
+                    "instruction": instruction,
+                    "current_inputs": current_inputs,
+                    "future_inputs": future_inputs,
+                    "actions": actions,
+                }
+
+
 def _stack_inputs(items):
     output = {}
     for key in items[0].keys():
@@ -360,16 +488,20 @@ def collate_droid_batch(batch):
 
 def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
-    if args.dataset_type != "droid_manifest":
-        raise RuntimeError(f"Unsupported dataset_type={args.dataset_type}. Expected droid_manifest.")
-    dataset = DroidManifestDataset(_load_records(args), processor, args, split_name=split, is_train=is_train)
+    if args.dataset_type == "droid_manifest":
+        dataset = DroidManifestDataset(_load_records(args), processor, args, split_name=split, is_train=is_train)
+    elif args.dataset_type == "droid_rlds":
+        dataset = DroidRLDSDataset(processor, args, split_name=split, is_train=is_train)
+    else:
+        raise RuntimeError(f"Unsupported dataset_type={args.dataset_type}. Expected droid_manifest or droid_rlds.")
     sampler = None
     shuffle = False
-    rank, world_size = _build_distributed_rank_info()
-    if world_size > 1:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=is_train, seed=args.seed, drop_last=False)
-    else:
-        shuffle = is_train
+    if not isinstance(dataset, IterableDataset):
+        rank, world_size = _build_distributed_rank_info()
+        if world_size > 1:
+            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=is_train, seed=args.seed, drop_last=False)
+        else:
+            shuffle = is_train
     kwargs = {
         "dataset": dataset,
         "batch_size": batch_size,

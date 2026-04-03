@@ -2,7 +2,7 @@
 
 DDP-friendly codebase for future-distribution-conditioned VLA training with an InternVL backbone.
 
-This project reuses the stable InternVL and `accelerate` patterns from `Belief-VLM`, but removes vector memory entirely. The default training path targets DROID-style robot trajectories through a local manifest.
+This project reuses the stable InternVL and `accelerate` patterns from `Belief-VLM`, but removes vector memory entirely. It supports both a local manifest format and a local TFDS/RLDS DROID export.
 
 ## Implemented method
 
@@ -13,7 +13,9 @@ This project reuses the stable InternVL and `accelerate` patterns from `Belief-V
 - Continuous action-chunk regression head
 - `accelerate`-based multi-GPU training
 
-## Expected dataset format
+## Dataset Modes
+
+### `droid_manifest`
 
 The current implementation uses a local `json/jsonl/csv` manifest. Each row should define one training sample with:
 
@@ -67,6 +69,31 @@ accelerate launch --num_processes 8 train.py \
   --chunk_horizon 16 \
   --save_dir checkpoints_future_pred_vla
 ```
+
+### `droid_rlds`
+
+The code can also read a local TFDS/RLDS DROID directory directly, for example:
+
+```bash
+/home/i2r/shahil_ws/driod_dataset/droid_100
+```
+
+Launch:
+
+```bash
+DATASET_TYPE=droid_rlds \
+DATA_ROOT=/home/i2r/shahil_ws/driod_dataset/droid_100 \
+./train_ddp.sh
+```
+
+Current defaults for the DROID subset you downloaded:
+
+- `image_key=wrist_image_left`
+- `future_image_key=wrist_image_left`
+- `action_dim=7`
+- `rlds_split=train`
+
+This mode requires `tensorflow-datasets` and TensorFlow to be installed in the environment.
 
 ## Notes
 
