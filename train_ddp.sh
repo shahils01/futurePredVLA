@@ -18,7 +18,7 @@ if [[ "$DATASET_TYPE" == "droid_rlds" && -z "$DATA_ROOT" ]]; then
   exit 1
 fi
 
-accelerate launch --num_processes 8 train.py \
+accelerate launch --num_processes 2 train.py \
   --dataset_type "$DATASET_TYPE" \
   --annotation_path "$ANNOTATION_PATH" \
   --media_root "$MEDIA_ROOT" \
