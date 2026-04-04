@@ -199,6 +199,49 @@ class ActionChunkHead(nn.Module):
 
 
 class FuturePredVLA(nn.Module):
+    @staticmethod
+    def _resolve_hidden_dim(backbone_model) -> int:
+        cfg = getattr(backbone_model, "config", None)
+        candidates = []
+        if cfg is not None:
+            candidates.extend(
+                [
+                    getattr(cfg, "hidden_size", None),
+                    getattr(getattr(cfg, "text_config", None), "hidden_size", None),
+                    getattr(getattr(cfg, "llm_config", None), "hidden_size", None),
+                    getattr(getattr(cfg, "language_config", None), "hidden_size", None),
+                ]
+            )
+        candidates.extend(
+            [
+                getattr(getattr(backbone_model, "language_model", None), "config", None),
+                getattr(getattr(backbone_model, "model", None), "config", None),
+            ]
+        )
+        for candidate in list(candidates):
+            if candidate is None:
+                continue
+            if isinstance(candidate, int):
+                return int(candidate)
+            value = getattr(candidate, "hidden_size", None)
+            if value is not None:
+                return int(value)
+            for attr in ("text_config", "llm_config", "language_config"):
+                nested = getattr(candidate, attr, None)
+                value = getattr(nested, "hidden_size", None)
+                if value is not None:
+                    return int(value)
+
+        for module in (
+            getattr(backbone_model, "lm_head", None),
+            getattr(getattr(backbone_model, "language_model", None), "lm_head", None),
+            getattr(getattr(backbone_model, "model", None), "lm_head", None),
+        ):
+            if module is not None and hasattr(module, "in_features"):
+                return int(module.in_features)
+
+        raise RuntimeError("Could not resolve language hidden size from the InternVL model/config.")
+
     def __init__(
         self,
         cfg: ModelConfig,
@@ -210,7 +253,7 @@ class FuturePredVLA(nn.Module):
     ):
         super().__init__()
         self.backbone = InternVLBackbone(cfg, device=device)
-        self.hidden_dim = int(getattr(self.backbone.model.config, "hidden_size"))
+        self.hidden_dim = self._resolve_hidden_dim(self.backbone.model)
         self.predictor = ConditionalFlowMatchingPredictor(
             latent_dim=self.hidden_dim,
             hidden_dim=int(predictor_hidden_dim),
