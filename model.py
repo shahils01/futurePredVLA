@@ -250,20 +250,26 @@ class FuturePredVLA(nn.Module):
         chunk_horizon: int,
         predictor_hidden_dim: int,
         num_future_tokens: int,
+        use_future_prediction: bool = True,
     ):
         super().__init__()
         self.backbone = InternVLBackbone(cfg, device=device)
         self.hidden_dim = self._resolve_hidden_dim(self.backbone.model)
-        self.predictor = ConditionalFlowMatchingPredictor(
-            latent_dim=self.hidden_dim,
-            hidden_dim=int(predictor_hidden_dim),
-            condition_dim=self.hidden_dim,
-        )
-        self.projector = FutureTokenProjector(
-            hidden_dim=self.hidden_dim,
-            latent_dim=self.hidden_dim,
-            num_future_tokens=num_future_tokens,
-        )
+        self.use_future_prediction = bool(use_future_prediction)
+        if self.use_future_prediction:
+            self.predictor = ConditionalFlowMatchingPredictor(
+                latent_dim=self.hidden_dim,
+                hidden_dim=int(predictor_hidden_dim),
+                condition_dim=self.hidden_dim,
+            )
+            self.projector = FutureTokenProjector(
+                hidden_dim=self.hidden_dim,
+                latent_dim=self.hidden_dim,
+                num_future_tokens=num_future_tokens,
+            )
+        else:
+            self.predictor = None
+            self.projector = None
         self.action_head = ActionChunkHead(
             hidden_dim=self.hidden_dim,
             action_dim=action_dim,
@@ -356,6 +362,8 @@ class FuturePredVLA(nn.Module):
         }
 
     def summarize_distribution(self, future_samples: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.projector is None:
+            raise RuntimeError("Future distribution summarization requested but future prediction is disabled.")
         mean = future_samples.mean(dim=1)
         std = future_samples.std(dim=1, unbiased=False)
         stats = torch.cat([mean, std], dim=-1)
@@ -373,6 +381,21 @@ class FuturePredVLA(nn.Module):
     ):
         current_encoded = self.encode_inputs(current_inputs)
         current_state = current_encoded["pooled_state"]
+
+        if not self.use_future_prediction:
+            pred_actions = self.action_head(current_state.float())
+            action_loss = None
+            if actions is not None:
+                action_loss = F.smooth_l1_loss(pred_actions, actions.float())
+            return {
+                "loss": action_loss,
+                "future_loss": None,
+                "action_loss": action_loss,
+                "pred_actions": pred_actions,
+                "current_state": current_state,
+                "future_samples": None,
+                "future_tokens": None,
+            }
 
         future_target = None
         if future_inputs is not None:

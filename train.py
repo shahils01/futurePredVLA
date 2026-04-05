@@ -96,6 +96,8 @@ def parse_args():
     parser.add_argument("--inject_layer_idx", type=int, default=1)
     parser.add_argument("--num_future_samples", type=int, default=4)
     parser.add_argument("--flow_sampling_steps", type=int, default=16)
+    parser.add_argument("--use_future_prediction", action="store_true", default=True)
+    parser.add_argument("--disable_future_prediction", dest="use_future_prediction", action="store_false")
     parser.add_argument("--future_loss_weight", type=float, default=1.0)
     parser.add_argument("--action_loss_weight", type=float, default=1.0)
 
@@ -211,6 +213,7 @@ def build_model(args, device):
         chunk_horizon=args.chunk_horizon,
         predictor_hidden_dim=args.predictor_hidden_dim,
         num_future_tokens=args.num_future_tokens,
+        use_future_prediction=args.use_future_prediction,
     )
 
 

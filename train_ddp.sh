@@ -45,6 +45,7 @@ accelerate launch --num_processes 4 train.py \
   --num_future_tokens "${NUM_FUTURE_TOKENS:-2}" \
   --num_future_samples "${NUM_FUTURE_SAMPLES:-4}" \
   --flow_sampling_steps "${FLOW_SAMPLING_STEPS:-16}" \
+  "${USE_FUTURE_PREDICTION_FLAG:---use_future_prediction}" \
   --grad_accum_steps "${GRAD_ACCUM_STEPS:-1}" \
   --epochs "${EPOCHS:-3}" \
   --lr "${LR:-2e-5}" \
