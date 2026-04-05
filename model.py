@@ -253,6 +253,49 @@ class ConditionalActionFlowMatchingHead(nn.Module):
         return xt
 
 
+class TokenPolicyConditioner(nn.Module):
+    def __init__(self, hidden_dim: int, num_queries: int = 4, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.num_queries = int(num_queries)
+        self.query_tokens = nn.Parameter(torch.randn(1, self.num_queries, self.hidden_dim) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=int(num_heads),
+            dim_feedforward=4 * self.hidden_dim,
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+        )
+        self.query_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.norm = nn.LayerNorm(self.hidden_dim)
+
+    def forward(self, sequence_hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = sequence_hidden.size(0)
+        queries = self.query_tokens.expand(batch, -1, -1)
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = attention_mask.to(dtype=torch.bool, device=sequence_hidden.device)
+            key_padding_mask = ~key_padding_mask
+        attended, _ = self.cross_attn(
+            query=queries,
+            key=sequence_hidden,
+            value=sequence_hidden,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        encoded = self.query_encoder(attended)
+        encoded = self.norm(encoded)
+        pooled = encoded.mean(dim=1)
+        return pooled, encoded
+
+
 class FuturePredVLA(nn.Module):
     @staticmethod
     def _resolve_hidden_dim(backbone_model) -> int:
@@ -308,12 +351,16 @@ class FuturePredVLA(nn.Module):
         use_future_prediction: bool = True,
         action_head_type: str = "regression",
         action_flow_hidden_dim: int = 2048,
+        policy_conditioning: str = "pooled",
+        policy_num_queries: int = 4,
+        policy_num_heads: int = 8,
     ):
         super().__init__()
         self.backbone = InternVLBackbone(cfg, device=device)
         self.hidden_dim = self._resolve_hidden_dim(self.backbone.model)
         self.use_future_prediction = bool(use_future_prediction)
         self.action_head_type = str(action_head_type)
+        self.policy_conditioning = str(policy_conditioning)
         if self.use_future_prediction:
             self.predictor = ConditionalFlowMatchingPredictor(
                 latent_dim=self.hidden_dim,
@@ -328,6 +375,16 @@ class FuturePredVLA(nn.Module):
         else:
             self.predictor = None
             self.projector = None
+        if self.policy_conditioning == "token":
+            self.policy_conditioner = TokenPolicyConditioner(
+                hidden_dim=self.hidden_dim,
+                num_queries=int(policy_num_queries),
+                num_heads=int(policy_num_heads),
+            )
+        elif self.policy_conditioning == "pooled":
+            self.policy_conditioner = None
+        else:
+            raise RuntimeError(f"Unsupported policy_conditioning={self.policy_conditioning}. Expected pooled or token.")
         if self.action_head_type == "flow":
             self.action_head = ConditionalActionFlowMatchingHead(
                 hidden_dim=self.hidden_dim,
@@ -438,6 +495,15 @@ class FuturePredVLA(nn.Module):
         tokens = self.projector(stats)
         return stats, tokens
 
+    def build_policy_condition(self, encoded: dict) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.policy_conditioner is None:
+            return encoded["pooled_state"], None
+        conditioned, query_tokens = self.policy_conditioner(
+            sequence_hidden=encoded["sequence_hidden"],
+            attention_mask=encoded.get("attention_mask"),
+        )
+        return conditioned, query_tokens
+
     def forward(
         self,
         current_inputs,
@@ -449,13 +515,14 @@ class FuturePredVLA(nn.Module):
     ):
         current_encoded = self.encode_inputs(current_inputs)
         current_state = current_encoded["pooled_state"]
+        current_policy_cond, current_policy_tokens = self.build_policy_condition(current_encoded)
 
         if not self.use_future_prediction:
             if self.action_head_type == "flow":
-                pred_actions = self.action_head.sample(current_state.float(), num_steps=flow_sampling_steps)
-                action_loss, _ = self.action_head.flow_matching_loss(current_state.float(), actions.float()) if actions is not None else (None, None)
+                pred_actions = self.action_head.sample(current_policy_cond.float(), num_steps=flow_sampling_steps)
+                action_loss, _ = self.action_head.flow_matching_loss(current_policy_cond.float(), actions.float()) if actions is not None else (None, None)
             else:
-                pred_actions = self.action_head(current_state.float())
+                pred_actions = self.action_head(current_policy_cond.float())
                 action_loss = F.smooth_l1_loss(pred_actions, actions.float()) if actions is not None else None
             return {
                 "loss": action_loss,
@@ -463,6 +530,8 @@ class FuturePredVLA(nn.Module):
                 "action_loss": action_loss,
                 "pred_actions": pred_actions,
                 "current_state": current_state,
+                "policy_condition": current_policy_cond,
+                "policy_tokens": current_policy_tokens,
                 "future_samples": None,
                 "future_tokens": None,
             }
@@ -489,12 +558,13 @@ class FuturePredVLA(nn.Module):
         finally:
             hook.remove()
         conditioned_state = conditioned["pooled_state"]
+        conditioned_policy_cond, conditioned_policy_tokens = self.build_policy_condition(conditioned)
 
         if self.action_head_type == "flow":
-            pred_actions = self.action_head.sample(conditioned_state.float(), num_steps=flow_sampling_steps)
-            action_loss, _ = self.action_head.flow_matching_loss(conditioned_state.float(), actions.float()) if actions is not None else (None, None)
+            pred_actions = self.action_head.sample(conditioned_policy_cond.float(), num_steps=flow_sampling_steps)
+            action_loss, _ = self.action_head.flow_matching_loss(conditioned_policy_cond.float(), actions.float()) if actions is not None else (None, None)
         else:
-            pred_actions = self.action_head(conditioned_state.float())
+            pred_actions = self.action_head(conditioned_policy_cond.float())
             action_loss = F.smooth_l1_loss(pred_actions, actions.float()) if actions is not None else None
 
         total_loss = None
@@ -511,6 +581,8 @@ class FuturePredVLA(nn.Module):
             "action_loss": action_loss,
             "pred_actions": pred_actions,
             "current_state": current_state,
+            "policy_condition": conditioned_policy_cond,
+            "policy_tokens": conditioned_policy_tokens,
             "future_samples": future_samples,
             "future_tokens": future_tokens,
         }
