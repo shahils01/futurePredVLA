@@ -198,6 +198,61 @@ class ActionChunkHead(nn.Module):
         return self.net(hidden).view(hidden.size(0), self.chunk_horizon, self.action_dim)
 
 
+class ConditionalActionFlowMatchingHead(nn.Module):
+    def __init__(self, hidden_dim: int, action_dim: int, chunk_horizon: int, flow_hidden_dim: int):
+        super().__init__()
+        self.action_dim = int(action_dim)
+        self.chunk_horizon = int(chunk_horizon)
+        self.flat_action_dim = self.action_dim * self.chunk_horizon
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, flow_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(flow_hidden_dim, flow_hidden_dim),
+        )
+        self.cond_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, flow_hidden_dim),
+            nn.GELU(),
+        )
+        self.net = nn.Sequential(
+            nn.Linear(self.flat_action_dim + 2 * flow_hidden_dim, flow_hidden_dim),
+            nn.GELU(),
+            nn.Linear(flow_hidden_dim, flow_hidden_dim),
+            nn.GELU(),
+            nn.Linear(flow_hidden_dim, self.flat_action_dim),
+        )
+
+    def forward(self, xt: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        batch = xt.size(0)
+        flat_xt = xt.view(batch, -1)
+        time_feat = self.time_mlp(t)
+        cond_feat = self.cond_mlp(cond)
+        velocity = self.net(torch.cat([flat_xt, cond_feat, time_feat], dim=-1))
+        return velocity.view(batch, self.chunk_horizon, self.action_dim)
+
+    def flow_matching_loss(self, cond: torch.Tensor, target_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        noise = torch.randn_like(target_actions)
+        t = torch.rand(target_actions.size(0), 1, device=target_actions.device, dtype=target_actions.dtype)
+        xt = (1.0 - t[:, None, :]) * noise + t[:, None, :] * target_actions
+        velocity_target = target_actions - noise
+        velocity_pred = self.forward(xt, t, cond)
+        loss = F.mse_loss(velocity_pred, velocity_target)
+        return loss, velocity_pred
+
+    @torch.no_grad()
+    def sample(self, cond: torch.Tensor, num_steps: int, noise_scale: float = 1.0) -> torch.Tensor:
+        batch = cond.size(0)
+        device = cond.device
+        dtype = cond.dtype
+        xt = noise_scale * torch.randn(batch, self.chunk_horizon, self.action_dim, device=device, dtype=dtype)
+        dt = 1.0 / max(int(num_steps), 1)
+        for step in range(int(num_steps)):
+            t_scalar = (step + 0.5) * dt
+            t = torch.full((batch, 1), fill_value=t_scalar, device=device, dtype=dtype)
+            xt = xt + dt * self.forward(xt, t, cond)
+        return xt
+
+
 class FuturePredVLA(nn.Module):
     @staticmethod
     def _resolve_hidden_dim(backbone_model) -> int:
@@ -251,11 +306,14 @@ class FuturePredVLA(nn.Module):
         predictor_hidden_dim: int,
         num_future_tokens: int,
         use_future_prediction: bool = True,
+        action_head_type: str = "regression",
+        action_flow_hidden_dim: int = 2048,
     ):
         super().__init__()
         self.backbone = InternVLBackbone(cfg, device=device)
         self.hidden_dim = self._resolve_hidden_dim(self.backbone.model)
         self.use_future_prediction = bool(use_future_prediction)
+        self.action_head_type = str(action_head_type)
         if self.use_future_prediction:
             self.predictor = ConditionalFlowMatchingPredictor(
                 latent_dim=self.hidden_dim,
@@ -270,11 +328,21 @@ class FuturePredVLA(nn.Module):
         else:
             self.predictor = None
             self.projector = None
-        self.action_head = ActionChunkHead(
-            hidden_dim=self.hidden_dim,
-            action_dim=action_dim,
-            chunk_horizon=chunk_horizon,
-        )
+        if self.action_head_type == "flow":
+            self.action_head = ConditionalActionFlowMatchingHead(
+                hidden_dim=self.hidden_dim,
+                action_dim=action_dim,
+                chunk_horizon=chunk_horizon,
+                flow_hidden_dim=int(action_flow_hidden_dim),
+            )
+        elif self.action_head_type == "regression":
+            self.action_head = ActionChunkHead(
+                hidden_dim=self.hidden_dim,
+                action_dim=action_dim,
+                chunk_horizon=chunk_horizon,
+            )
+        else:
+            raise RuntimeError(f"Unsupported action_head_type={self.action_head_type}. Expected regression or flow.")
 
     def get_language_layers(self):
         queue = [
@@ -383,10 +451,12 @@ class FuturePredVLA(nn.Module):
         current_state = current_encoded["pooled_state"]
 
         if not self.use_future_prediction:
-            pred_actions = self.action_head(current_state.float())
-            action_loss = None
-            if actions is not None:
-                action_loss = F.smooth_l1_loss(pred_actions, actions.float())
+            if self.action_head_type == "flow":
+                pred_actions = self.action_head.sample(current_state.float(), num_steps=flow_sampling_steps)
+                action_loss, _ = self.action_head.flow_matching_loss(current_state.float(), actions.float()) if actions is not None else (None, None)
+            else:
+                pred_actions = self.action_head(current_state.float())
+                action_loss = F.smooth_l1_loss(pred_actions, actions.float()) if actions is not None else None
             return {
                 "loss": action_loss,
                 "future_loss": None,
@@ -420,10 +490,12 @@ class FuturePredVLA(nn.Module):
             hook.remove()
         conditioned_state = conditioned["pooled_state"]
 
-        pred_actions = self.action_head(conditioned_state.float())
-        action_loss = None
-        if actions is not None:
-            action_loss = F.smooth_l1_loss(pred_actions, actions.float())
+        if self.action_head_type == "flow":
+            pred_actions = self.action_head.sample(conditioned_state.float(), num_steps=flow_sampling_steps)
+            action_loss, _ = self.action_head.flow_matching_loss(conditioned_state.float(), actions.float()) if actions is not None else (None, None)
+        else:
+            pred_actions = self.action_head(conditioned_state.float())
+            action_loss = F.smooth_l1_loss(pred_actions, actions.float()) if actions is not None else None
 
         total_loss = None
         if future_loss is not None and action_loss is not None:
