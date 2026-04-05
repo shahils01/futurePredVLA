@@ -18,13 +18,13 @@ if [[ "$DATASET_TYPE" == "droid_rlds" && -z "$DATA_ROOT" ]]; then
   exit 1
 fi
 
-accelerate launch --num_processes 4 train.py \
+accelerate launch --num_processes 2 train.py \
   --dataset_type "$DATASET_TYPE" \
   --annotation_path "$ANNOTATION_PATH" \
   --media_root "$MEDIA_ROOT" \
   --data_root "$DATA_ROOT" \
   --vl_model_name "$VL_MODEL_NAME" \
-  --batch_size "${BATCH_SIZE:-4}" \
+  --batch_size "${BATCH_SIZE:-32}" \
   --num_workers "${NUM_WORKERS:-1}" \
   --video_frames "${VIDEO_FRAMES:-8}" \
   --future_video_frames "${FUTURE_VIDEO_FRAMES:-4}" \
@@ -33,13 +33,9 @@ accelerate launch --num_processes 4 train.py \
   --future_span "${FUTURE_SPAN:-4}" \
   --image_key "${IMAGE_KEY:-wrist_image_left}" \
   --future_image_key "${FUTURE_IMAGE_KEY:-wrist_image_left}" \
-  --image_keys "${IMAGE_KEYS:-}" \
-  --future_image_keys "${FUTURE_IMAGE_KEYS:-}" \
   --default_prompt "${DEFAULT_PROMPT:-You are controlling a robot from visual observations and task instructions.}" \
-  --state_conditioning "${STATE_CONDITIONING:-text}" \
+  --include_robot_state \
   --robot_state_keys "${ROBOT_STATE_KEYS:-cartesian_position,gripper_position,joint_position}" \
-  --robot_state_dim "${ROBOT_STATE_DIM:-14}" \
-  --num_state_tokens "${NUM_STATE_TOKENS:-2}" \
   --robot_state_precision "${ROBOT_STATE_PRECISION:-4}" \
   --rlds_episode_shuffle_buffer "${RLDS_EPISODE_SHUFFLE_BUFFER:-500000}" \
   --rlds_max_samples_per_episode "${RLDS_MAX_SAMPLES_PER_EPISODE:-64}" \
@@ -60,11 +56,12 @@ accelerate launch --num_processes 4 train.py \
   --policy_num_heads "${POLICY_NUM_HEADS:-8}" \
   "${USE_FUTURE_PREDICTION_FLAG:---use_future_prediction}" \
   --grad_accum_steps "${GRAD_ACCUM_STEPS:-1}" \
-  --epochs "${EPOCHS:-10}" \
-  --lr "${LR:-1e-4}" \
+  --epochs "${EPOCHS:-3}" \
+  --lr "${LR:-2e-5}" \
   --mixed_precision "${MIXED_PRECISION:-bf16}" \
   --save_every_steps "${SAVE_EVERY_STEPS:-5000}" \
   --max_step_checkpoints "${MAX_STEP_CHECKPOINTS:-3}" \
   --save_latest \
   --save_dir "$SAVE_DIR" \
+  --freeze_vl \
   "$@"
