@@ -2,6 +2,7 @@ import argparse
 import functools
 import inspect
 import os
+import shutil
 
 import torch
 from accelerate import Accelerator
@@ -59,10 +60,14 @@ def parse_args():
     parser.add_argument("--rlds_dataset_name", type=str, default="r2d2_faceblur")
     parser.add_argument("--image_key", type=str, default="wrist_image_left")
     parser.add_argument("--future_image_key", type=str, default="wrist_image_left")
-    parser.add_argument("--rlds_episode_shuffle_buffer", type=int, default=256)
+    parser.add_argument("--rlds_episode_shuffle_buffer", type=int, default=500000)
     parser.add_argument("--rlds_shuffle_steps", action="store_true", default=True)
     parser.add_argument("--no_rlds_shuffle_steps", dest="rlds_shuffle_steps", action="store_false")
     parser.add_argument("--rlds_max_samples_per_episode", type=int, default=64)
+    parser.add_argument("--normalize_actions", action="store_true")
+    parser.add_argument("--action_stats_path", type=str, default="")
+    parser.add_argument("--action_stats_max_episodes", type=int, default=0)
+    parser.add_argument("--action_stats_max_steps", type=int, default=500000)
 
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--fsdp", action="store_true")
@@ -100,6 +105,9 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--save_dir", type=str, default="checkpoints_future_pred_vla")
+    parser.add_argument("--save_every_steps", type=int, default=5000)
+    parser.add_argument("--max_step_checkpoints", type=int, default=3)
+    parser.add_argument("--save_latest", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--load_model_only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -206,7 +214,55 @@ def build_model(args, device):
     )
 
 
-def run_epoch(model, loader, optimizer, accelerator, args, train: bool, global_step: int):
+def _checkpoint_state(model, optimizer, args, epoch: int, global_step: int):
+    return {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "args": vars(args),
+    }
+
+
+def _rotate_step_checkpoints(save_dir: str, max_to_keep: int):
+    if int(max_to_keep) <= 0:
+        return
+    candidates = []
+    for filename in os.listdir(save_dir):
+        if not (filename.startswith("ckpt_step_") and filename.endswith(".pt")):
+            continue
+        path = os.path.join(save_dir, filename)
+        try:
+            step = int(filename[len("ckpt_step_") : -len(".pt")])
+        except ValueError:
+            continue
+        candidates.append((step, path))
+    candidates.sort()
+    while len(candidates) > int(max_to_keep):
+        _, path = candidates.pop(0)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _save_checkpoint(accelerator, model, optimizer, args, epoch: int, global_step: int, tag: str, rotate_steps: bool = False):
+    accelerator.wait_for_everyone()
+    if not accelerator.is_main_process:
+        return
+    unwrapped = accelerator.unwrap_model(model)
+    ckpt_path = os.path.join(args.save_dir, f"{tag}.pt")
+    torch.save(
+        _checkpoint_state(unwrapped, optimizer, args, epoch=epoch, global_step=global_step),
+        ckpt_path,
+    )
+    if args.save_latest:
+        latest_path = os.path.join(args.save_dir, "latest.pt")
+        shutil.copy2(ckpt_path, latest_path)
+    if rotate_steps and tag.startswith("ckpt_step_"):
+        _rotate_step_checkpoints(args.save_dir, args.max_step_checkpoints)
+    accelerator.print(f"saved checkpoint={ckpt_path}")
+
+
+def run_epoch(model, loader, optimizer, accelerator, args, train: bool, global_step: int, epoch: int):
     model.train() if train else model.eval()
     total_loss = 0.0
     total_action_loss = 0.0
@@ -271,6 +327,20 @@ def run_epoch(model, loader, optimizer, accelerator, args, train: bool, global_s
                     accelerator.log(metrics, step=global_step + step)
                 else:
                     accelerator.log(metrics, step=global_step)
+
+        if train and int(args.save_every_steps) > 0:
+            absolute_step = global_step + step
+            if absolute_step % int(args.save_every_steps) == 0:
+                _save_checkpoint(
+                    accelerator=accelerator,
+                    model=model,
+                    optimizer=optimizer,
+                    args=args,
+                    epoch=epoch,
+                    global_step=absolute_step,
+                    tag=f"ckpt_step_{absolute_step}",
+                    rotate_steps=True,
+                )
     avg_total = total_loss / max(total_examples, 1)
     avg_action = total_action_loss / max(total_examples, 1)
     avg_future = total_future_loss / max(total_examples, 1)
@@ -391,7 +461,7 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         _set_loader_epoch(train_loader, epoch)
-        train_metrics, global_step = run_epoch(model, train_loader, optimizer, accelerator, args, True, global_step)
+        train_metrics, global_step = run_epoch(model, train_loader, optimizer, accelerator, args, True, global_step, epoch)
         accelerator.print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
             f"train_action={train_metrics['action_loss']:.4f} train_future={train_metrics['future_loss']:.4f}"
@@ -402,7 +472,7 @@ def main():
         if val_loader is not None:
             _set_loader_epoch(val_loader, epoch)
             with torch.no_grad():
-                val_metrics, _ = run_epoch(model, val_loader, optimizer, accelerator, args, False, global_step)
+                val_metrics, _ = run_epoch(model, val_loader, optimizer, accelerator, args, False, global_step, epoch)
             accelerator.print(
                 f"epoch={epoch} val_loss={val_metrics['loss']:.4f} "
                 f"val_action={val_metrics['action_loss']:.4f} val_future={val_metrics['future_loss']:.4f}"
@@ -410,20 +480,16 @@ def main():
             if args.wandb:
                 accelerator.log({f"val/epoch_{key}": value for key, value in val_metrics.items()}, step=global_step)
 
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            ckpt_path = os.path.join(args.save_dir, f"ckpt_epoch_{epoch}.pt")
-            torch.save(
-                {
-                    "model": accelerator.unwrap_model(model).state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "args": vars(args),
-                },
-                ckpt_path,
-            )
-            accelerator.print(f"saved checkpoint={ckpt_path}")
+        _save_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizer=optimizer,
+            args=args,
+            epoch=epoch,
+            global_step=global_step,
+            tag=f"ckpt_epoch_{epoch}",
+            rotate_steps=False,
+        )
     accelerator.end_training()
 
 

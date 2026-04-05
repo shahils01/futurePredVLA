@@ -123,6 +123,15 @@ def _load_records(args):
     return records
 
 
+def _resolve_rlds_version_dir(args) -> str:
+    root = args.data_root or args.media_root or args.annotation_path
+    if not root:
+        raise RuntimeError("droid_rlds requires --data_root pointing to the local TFDS directory.")
+    if os.path.isdir(os.path.join(root, "1.0.0")):
+        return os.path.join(root, "1.0.0")
+    return root
+
+
 def _stable_fold(value: str, seed: int) -> float:
     digest = hashlib.md5(f"{seed}:{value}".encode("utf-8")).hexdigest()
     return int(digest[:8], 16) / 0xFFFFFFFF
@@ -266,13 +275,101 @@ def _build_distributed_rank_info():
     return 0, 1
 
 
+def _default_action_stats_path(args) -> str:
+    base_dir = args.save_dir if getattr(args, "save_dir", "") else (args.data_root or ".")
+    return os.path.join(base_dir, f"action_stats_{args.dataset_type}_{args.action_dim}d.json")
+
+
+def _load_action_stats(path: str):
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    mean = torch.tensor(payload["mean"], dtype=torch.float32)
+    std = torch.tensor(payload["std"], dtype=torch.float32)
+    return {"mean": mean, "std": std, "count": int(payload.get("count", 0))}
+
+
+def _save_action_stats(path: str, mean: np.ndarray, std: np.ndarray, count: int):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "mean": mean.astype(float).tolist(),
+                "std": std.astype(float).tolist(),
+                "count": int(count),
+            },
+            handle,
+        )
+
+
+def _compute_rlds_action_stats(args):
+    try:
+        import tensorflow as tf
+        import tensorflow_datasets as tfds
+    except Exception as exc:
+        raise RuntimeError(
+            "Computing RLDS action stats requires tensorflow and tensorflow-datasets."
+        ) from exc
+
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except Exception:
+        pass
+
+    builder = tfds.builder_from_directory(_resolve_rlds_version_dir(args))
+    dataset = tfds.as_numpy(builder.as_dataset(split=args.rlds_split))
+    max_episodes = int(args.action_stats_max_episodes)
+    max_steps = int(args.action_stats_max_steps)
+
+    count = 0
+    mean = np.zeros(int(args.action_dim), dtype=np.float64)
+    m2 = np.zeros(int(args.action_dim), dtype=np.float64)
+    for episode_idx, episode in enumerate(dataset):
+        if max_episodes > 0 and episode_idx >= max_episodes:
+            break
+        for step in episode.get("steps", []):
+            action = np.asarray(step["action"], dtype=np.float64)
+            if action.shape[-1] != int(args.action_dim):
+                raise RuntimeError(f"Expected action_dim={args.action_dim}, got {action.shape[-1]}")
+            count += 1
+            delta = action - mean
+            mean = mean + delta / count
+            delta2 = action - mean
+            m2 = m2 + delta * delta2
+            if max_steps > 0 and count >= max_steps:
+                break
+        if max_steps > 0 and count >= max_steps:
+            break
+    if count < 2:
+        raise RuntimeError("Not enough action samples to compute normalization stats.")
+    var = m2 / max(count - 1, 1)
+    std = np.sqrt(np.maximum(var, 1e-6))
+    return {"mean": torch.tensor(mean, dtype=torch.float32), "std": torch.tensor(std, dtype=torch.float32), "count": count}
+
+
+def resolve_action_stats(args):
+    if not getattr(args, "normalize_actions", False):
+        return None
+    path = args.action_stats_path or _default_action_stats_path(args)
+    if os.path.exists(path):
+        return _load_action_stats(path)
+    if args.dataset_type != "droid_rlds":
+        raise RuntimeError(
+            "Action stats cache not found. For non-RLDS datasets, provide --action_stats_path explicitly."
+        )
+    stats = _compute_rlds_action_stats(args)
+    _save_action_stats(path, stats["mean"].numpy(), stats["std"].numpy(), stats["count"])
+    return stats
+
+
 class DroidManifestDataset(Dataset):
-    def __init__(self, records, processor, args, split_name: str, is_train: bool):
+    def __init__(self, records, processor, args, split_name: str, is_train: bool, action_stats=None):
         self.records = []
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
+        self.action_mean = action_stats["mean"] if action_stats is not None else None
+        self.action_std = action_stats["std"] if action_stats is not None else None
         max_samples = int(args.max_samples_per_split)
         for idx, record in enumerate(records):
             sample_id = str(_get_first(record, ["id", "sample_id", "uid"], default=idx))
@@ -335,6 +432,8 @@ class DroidManifestDataset(Dataset):
                 actions = torch.cat([actions, pad], dim=0)
         if actions.size(1) != int(self.args.action_dim):
             raise RuntimeError(f"Expected action_dim={self.args.action_dim}, got {actions.size(1)} for sample {sample_id}")
+        if self.action_mean is not None and self.action_std is not None:
+            actions = (actions - self.action_mean.view(1, -1)) / self.action_std.view(1, -1)
 
         return {
             "id": sample_id,
@@ -347,12 +446,14 @@ class DroidManifestDataset(Dataset):
 
 
 class DroidRLDSDataset(IterableDataset):
-    def __init__(self, processor, args, split_name: str, is_train: bool):
+    def __init__(self, processor, args, split_name: str, is_train: bool, action_stats=None):
         self.processor = processor
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
         self.epoch = 0
+        self.action_mean = action_stats["mean"] if action_stats is not None else None
+        self.action_std = action_stats["std"] if action_stats is not None else None
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
@@ -365,12 +466,7 @@ class DroidRLDSDataset(IterableDataset):
                 "dataset_type=droid_rlds requires tensorflow-datasets. Install `tensorflow-datasets` and TensorFlow."
             ) from exc
 
-        root = self.args.data_root or self.args.media_root or self.args.annotation_path
-        if not root:
-            raise RuntimeError("droid_rlds requires --data_root pointing to the local TFDS directory.")
-        version_dir = root
-        if os.path.isdir(os.path.join(root, "1.0.0")):
-            version_dir = os.path.join(root, "1.0.0")
+        version_dir = _resolve_rlds_version_dir(self.args)
         builder = tfds.builder_from_directory(version_dir)
         dataset = builder.as_dataset(split=self.args.rlds_split)
         if self.is_train and int(self.args.rlds_episode_shuffle_buffer) > 1:
@@ -463,6 +559,8 @@ class DroidRLDSDataset(IterableDataset):
                     axis=0,
                 )
                 actions = torch.tensor(actions, dtype=torch.float32)
+                if self.action_mean is not None and self.action_std is not None:
+                    actions = (actions - self.action_mean.view(1, -1)) / self.action_std.view(1, -1)
 
                 current_inputs = build_prompt_only_example(self.processor, current_frames, instruction)
                 future_inputs = build_prompt_only_example(self.processor, future_frames, instruction)
@@ -508,10 +606,11 @@ def collate_droid_batch(batch):
 
 def build_train_loader(args, split: str, batch_size: int, num_workers: int, is_train: bool):
     processor = build_vlm_processor(args)
+    action_stats = resolve_action_stats(args) if is_train or getattr(args, "normalize_actions", False) else None
     if args.dataset_type == "droid_manifest":
-        dataset = DroidManifestDataset(_load_records(args), processor, args, split_name=split, is_train=is_train)
+        dataset = DroidManifestDataset(_load_records(args), processor, args, split_name=split, is_train=is_train, action_stats=action_stats)
     elif args.dataset_type == "droid_rlds":
-        dataset = DroidRLDSDataset(processor, args, split_name=split, is_train=is_train)
+        dataset = DroidRLDSDataset(processor, args, split_name=split, is_train=is_train, action_stats=action_stats)
     else:
         raise RuntimeError(f"Unsupported dataset_type={args.dataset_type}. Expected droid_manifest or droid_rlds.")
     sampler = None

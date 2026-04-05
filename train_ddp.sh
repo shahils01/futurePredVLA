@@ -33,8 +33,12 @@ accelerate launch --num_processes 2 train.py \
   --future_span "${FUTURE_SPAN:-4}" \
   --image_key "${IMAGE_KEY:-wrist_image_left}" \
   --future_image_key "${FUTURE_IMAGE_KEY:-wrist_image_left}" \
-  --rlds_episode_shuffle_buffer "${RLDS_EPISODE_SHUFFLE_BUFFER:-256}" \
+  --rlds_episode_shuffle_buffer "${RLDS_EPISODE_SHUFFLE_BUFFER:-500000}" \
   --rlds_max_samples_per_episode "${RLDS_MAX_SAMPLES_PER_EPISODE:-64}" \
+  --normalize_actions \
+  --action_stats_path "${ACTION_STATS_PATH:-}" \
+  --action_stats_max_episodes "${ACTION_STATS_MAX_EPISODES:-0}" \
+  --action_stats_max_steps "${ACTION_STATS_MAX_STEPS:-500000}" \
   --chunk_horizon "${CHUNK_HORIZON:-16}" \
   --action_dim "${ACTION_DIM:-7}" \
   --predictor_hidden_dim "${PREDICTOR_HIDDEN_DIM:-2048}" \
@@ -45,5 +49,8 @@ accelerate launch --num_processes 2 train.py \
   --epochs "${EPOCHS:-3}" \
   --lr "${LR:-2e-5}" \
   --mixed_precision "${MIXED_PRECISION:-bf16}" \
+  --save_every_steps "${SAVE_EVERY_STEPS:-5000}" \
+  --max_step_checkpoints "${MAX_STEP_CHECKPOINTS:-3}" \
+  --save_latest \
   --save_dir "$SAVE_DIR" \
   "$@"
