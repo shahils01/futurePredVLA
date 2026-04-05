@@ -33,6 +33,8 @@ accelerate launch --num_processes 2 train.py \
   --future_span "${FUTURE_SPAN:-4}" \
   --image_key "${IMAGE_KEY:-wrist_image_left}" \
   --future_image_key "${FUTURE_IMAGE_KEY:-wrist_image_left}" \
+  --rlds_episode_shuffle_buffer "${RLDS_EPISODE_SHUFFLE_BUFFER:-256}" \
+  --rlds_max_samples_per_episode "${RLDS_MAX_SAMPLES_PER_EPISODE:-64}" \
   --chunk_horizon "${CHUNK_HORIZON:-16}" \
   --action_dim "${ACTION_DIM:-7}" \
   --predictor_hidden_dim "${PREDICTOR_HIDDEN_DIM:-2048}" \

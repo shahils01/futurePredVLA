@@ -59,6 +59,10 @@ def parse_args():
     parser.add_argument("--rlds_dataset_name", type=str, default="r2d2_faceblur")
     parser.add_argument("--image_key", type=str, default="wrist_image_left")
     parser.add_argument("--future_image_key", type=str, default="wrist_image_left")
+    parser.add_argument("--rlds_episode_shuffle_buffer", type=int, default=256)
+    parser.add_argument("--rlds_shuffle_steps", action="store_true", default=True)
+    parser.add_argument("--no_rlds_shuffle_steps", dest="rlds_shuffle_steps", action="store_false")
+    parser.add_argument("--rlds_max_samples_per_episode", type=int, default=64)
 
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--fsdp", action="store_true")
@@ -273,6 +277,15 @@ def run_epoch(model, loader, optimizer, accelerator, args, train: bool, global_s
     return {"loss": avg_total, "action_loss": avg_action, "future_loss": avg_future}, (global_step + step if train else global_step)
 
 
+def _set_loader_epoch(loader, epoch: int):
+    dataset = getattr(loader, "dataset", None)
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
@@ -377,6 +390,7 @@ def main():
             accelerator.print(f"resumed checkpoint={args.resume_checkpoint} start_epoch={start_epoch}")
 
     for epoch in range(start_epoch, args.epochs):
+        _set_loader_epoch(train_loader, epoch)
         train_metrics, global_step = run_epoch(model, train_loader, optimizer, accelerator, args, True, global_step)
         accelerator.print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
@@ -386,6 +400,7 @@ def main():
             accelerator.log({f"train/epoch_{key}": value for key, value in train_metrics.items()}, step=global_step)
 
         if val_loader is not None:
+            _set_loader_epoch(val_loader, epoch)
             with torch.no_grad():
                 val_metrics, _ = run_epoch(model, val_loader, optimizer, accelerator, args, False, global_step)
             accelerator.print(

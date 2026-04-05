@@ -352,6 +352,10 @@ class DroidRLDSDataset(IterableDataset):
         self.args = args
         self.split_name = split_name
         self.is_train = is_train
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
 
     def _episode_iter(self):
         try:
@@ -369,6 +373,12 @@ class DroidRLDSDataset(IterableDataset):
             version_dir = os.path.join(root, "1.0.0")
         builder = tfds.builder_from_directory(version_dir)
         dataset = builder.as_dataset(split=self.args.rlds_split)
+        if self.is_train and int(self.args.rlds_episode_shuffle_buffer) > 1:
+            dataset = dataset.shuffle(
+                buffer_size=int(self.args.rlds_episode_shuffle_buffer),
+                seed=int(self.args.seed) + int(self.epoch),
+                reshuffle_each_iteration=False,
+            )
         return tfds.as_numpy(dataset)
 
     def __iter__(self):
@@ -380,6 +390,9 @@ class DroidRLDSDataset(IterableDataset):
         shard_count = world_size * num_workers
 
         emitted = 0
+        local_rng = np.random.default_rng(
+            int(self.args.seed) + 10_000 * int(self.epoch) + 1_000 * int(rank) + int(worker_id)
+        )
         for episode_idx, episode in enumerate(self._episode_iter()):
             if shard_count > 1 and episode_idx % shard_count != shard_index:
                 continue
@@ -393,7 +406,14 @@ class DroidRLDSDataset(IterableDataset):
             file_path = _to_text(episode.get("episode_metadata", {}).get("file_path", f"episode_{episode_idx}"))
             task_name = os.path.basename(os.path.dirname(file_path)) or self.args.rlds_dataset_name
 
-            for step_idx in range(max_start):
+            candidate_step_indices = np.arange(max_start, dtype=np.int64)
+            if self.is_train and self.args.rlds_shuffle_steps:
+                local_rng.shuffle(candidate_step_indices)
+            max_per_episode = int(self.args.rlds_max_samples_per_episode)
+            if max_per_episode > 0 and candidate_step_indices.size > max_per_episode:
+                candidate_step_indices = candidate_step_indices[:max_per_episode]
+
+            for step_idx in candidate_step_indices.tolist():
                 sample_id = f"{file_path}:{step_idx}"
                 fold = _stable_fold(sample_id, self.args.seed)
                 in_val = fold < max(0.0, min(0.5, float(self.args.val_ratio)))
