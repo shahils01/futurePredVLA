@@ -18,14 +18,14 @@ if [[ "$DATASET_TYPE" == "droid_rlds" && -z "$DATA_ROOT" ]]; then
   exit 1
 fi
 
-accelerate launch --num_processes 2 train.py \
+accelerate launch --num_processes 4 train.py \
   --dataset_type "$DATASET_TYPE" \
   --annotation_path "$ANNOTATION_PATH" \
   --media_root "$MEDIA_ROOT" \
   --data_root "$DATA_ROOT" \
   --vl_model_name "$VL_MODEL_NAME" \
   --batch_size "${BATCH_SIZE:-1}" \
-  --num_workers "${NUM_WORKERS:-4}" \
+  --num_workers "${NUM_WORKERS:-1}" \
   --video_frames "${VIDEO_FRAMES:-4}" \
   --future_video_frames "${FUTURE_VIDEO_FRAMES:-4}" \
   --current_history "${CURRENT_HISTORY:-4}" \
