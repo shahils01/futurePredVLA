@@ -60,9 +60,14 @@ def parse_args():
     parser.add_argument("--rlds_dataset_name", type=str, default="r2d2_faceblur")
     parser.add_argument("--image_key", type=str, default="wrist_image_left")
     parser.add_argument("--future_image_key", type=str, default="wrist_image_left")
+    parser.add_argument("--image_keys", type=str, default="")
+    parser.add_argument("--future_image_keys", type=str, default="")
     parser.add_argument("--default_prompt", type=str, default="You are controlling a robot from visual observations and task instructions.")
+    parser.add_argument("--state_conditioning", type=str, default="text", choices=["off", "text", "token"])
     parser.add_argument("--include_robot_state", action="store_true")
     parser.add_argument("--robot_state_keys", type=str, default="cartesian_position,gripper_position,joint_position")
+    parser.add_argument("--robot_state_dim", type=int, default=14)
+    parser.add_argument("--num_state_tokens", type=int, default=2)
     parser.add_argument("--robot_state_precision", type=int, default=4)
     parser.add_argument("--rlds_episode_shuffle_buffer", type=int, default=500000)
     parser.add_argument("--rlds_shuffle_steps", action="store_true", default=True)
@@ -228,6 +233,9 @@ def build_model(args, device):
         policy_conditioning=args.policy_conditioning,
         policy_num_queries=args.policy_num_queries,
         policy_num_heads=args.policy_num_heads,
+        state_conditioning=args.state_conditioning,
+        robot_state_dim=args.robot_state_dim,
+        num_state_tokens=args.num_state_tokens,
     )
 
 
@@ -298,12 +306,14 @@ def run_epoch(model, loader, optimizer, accelerator, args, train: bool, global_s
             for key, value in batch["future_inputs"].items()
         }
         actions = batch["actions"].to(accelerator.device)
+        robot_state = batch["robot_state"].to(accelerator.device)
 
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
                 outputs = model(
                     current_inputs=current_inputs,
                     future_inputs=future_inputs,
+                    robot_state=robot_state,
                     actions=actions,
                     inject_layer_idx=args.inject_layer_idx,
                     num_future_samples=args.num_future_samples,
@@ -375,7 +385,10 @@ def _set_loader_epoch(loader, epoch: int):
 
 def main():
     args = parse_args()
+    args.include_robot_state = args.state_conditioning != "off" or args.include_robot_state
     args.robot_state_keys = [item.strip() for item in str(args.robot_state_keys).split(",") if item.strip()]
+    args.image_keys = [item.strip() for item in str(args.image_keys).split(",") if item.strip()] or [args.image_key]
+    args.future_image_keys = [item.strip() for item in str(args.future_image_keys).split(",") if item.strip()] or [args.future_image_key]
     os.makedirs(args.save_dir, exist_ok=True)
 
     if args.peft == "qlora" and args.fsdp:

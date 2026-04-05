@@ -172,10 +172,25 @@ def _extract_robot_state_from_step(step: dict, args):
     return components
 
 
+def _flatten_robot_state_components(robot_state_components, expected_dim: int) -> torch.Tensor:
+    flat_parts = []
+    for _, values in robot_state_components:
+        flat_parts.append(np.asarray(values, dtype=np.float32).reshape(-1))
+    if flat_parts:
+        flat = np.concatenate(flat_parts, axis=0)
+    else:
+        flat = np.zeros(int(expected_dim), dtype=np.float32)
+    if flat.shape[0] < int(expected_dim):
+        flat = np.pad(flat, (0, int(expected_dim) - flat.shape[0]), mode="constant")
+    elif flat.shape[0] > int(expected_dim):
+        flat = flat[: int(expected_dim)]
+    return torch.tensor(flat, dtype=torch.float32)
+
+
 def _build_control_prompt(task_instruction: str, robot_state_components, args) -> str:
     task_instruction = _to_text(task_instruction).strip() or args.default_prompt
     lines = [args.default_prompt, f"Task: {task_instruction}"]
-    if getattr(args, "include_robot_state", False) and robot_state_components:
+    if getattr(args, "state_conditioning", "text") == "text" and robot_state_components:
         state_parts = [f"{name}=[{_format_float_list(values, precision=args.robot_state_precision)}]" for name, values in robot_state_components]
         lines.append("Robot state: " + "; ".join(state_parts))
     lines.append("Predict the next robot action chunk from this observation.")
@@ -189,6 +204,33 @@ def _np_image_to_pil(value) -> Image.Image:
     if array.dtype != np.uint8:
         array = np.clip(array, 0, 255).astype(np.uint8)
     return Image.fromarray(array).convert("RGB")
+
+
+def _compose_multi_view_frame(frames):
+    if not frames:
+        raise RuntimeError("Expected at least one frame to compose.")
+    if len(frames) == 1:
+        return frames[0]
+    widths = [img.width for img in frames]
+    heights = [img.height for img in frames]
+    canvas = Image.new("RGB", (sum(widths), max(heights)))
+    x_offset = 0
+    for img in frames:
+        canvas.paste(img, (x_offset, 0))
+        x_offset += img.width
+    return canvas
+
+
+def _extract_view_frame_from_step(step: dict, image_keys):
+    observation = step.get("observation", {}) if isinstance(step, dict) else {}
+    frames = []
+    for key in image_keys:
+        if key in observation:
+            frames.append(_np_image_to_pil(observation[key]))
+    if not frames:
+        available = sorted(observation.keys()) if isinstance(observation, dict) else []
+        raise RuntimeError(f"None of the requested image keys were found. requested={image_keys} available={available}")
+    return _compose_multi_view_frame(frames)
 
 
 def _resolve_frame_paths(root: str, value):
@@ -443,6 +485,7 @@ class DroidManifestDataset(Dataset):
             for key in getattr(self.args, "robot_state_keys", []):
                 if key in record:
                     robot_state_components.append((key, np.asarray(record[key], dtype=np.float32)))
+        robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
         instruction = _build_control_prompt(raw_instruction, robot_state_components, self.args)
 
         current_inputs = build_prompt_only_example(self.processor, current_frames, instruction)
@@ -472,6 +515,7 @@ class DroidManifestDataset(Dataset):
             "instruction": instruction,
             "current_inputs": current_inputs,
             "future_inputs": future_inputs,
+            "robot_state": robot_state,
             "actions": actions,
         }
 
@@ -569,11 +613,11 @@ class DroidRLDSDataset(IterableDataset):
                 )
 
                 current_frames = [
-                    _np_image_to_pil(steps[int(idx)]["observation"][self.args.image_key])
+                    _extract_view_frame_from_step(steps[int(idx)], self.args.image_keys)
                     for idx in current_indices
                 ]
                 future_frames = [
-                    _np_image_to_pil(steps[int(idx)]["observation"][self.args.future_image_key])
+                    _extract_view_frame_from_step(steps[int(idx)], self.args.future_image_keys)
                     for idx in future_indices
                 ]
 
@@ -583,6 +627,7 @@ class DroidRLDSDataset(IterableDataset):
                     if instruction:
                         break
                 robot_state_components = _extract_robot_state_from_step(steps[step_idx], self.args)
+                robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
                 instruction = _build_control_prompt(instruction, robot_state_components, self.args)
 
                 actions = np.stack(
@@ -602,6 +647,7 @@ class DroidRLDSDataset(IterableDataset):
                     "instruction": instruction,
                     "current_inputs": current_inputs,
                     "future_inputs": future_inputs,
+                    "robot_state": robot_state,
                     "actions": actions,
                 }
 
@@ -631,6 +677,7 @@ def collate_droid_batch(batch):
         "instructions": [item["instruction"] for item in batch],
         "current_inputs": _stack_inputs([item["current_inputs"] for item in batch]),
         "future_inputs": _stack_inputs([item["future_inputs"] for item in batch]),
+        "robot_state": torch.stack([item["robot_state"] for item in batch], dim=0),
         "actions": torch.stack([item["actions"] for item in batch], dim=0),
     }
 

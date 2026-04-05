@@ -138,6 +138,25 @@ class FutureTokenProjector(nn.Module):
         return self.norm(tokens)
 
 
+class StateTokenProjector(nn.Module):
+    def __init__(self, hidden_dim: int, state_dim: int, num_state_tokens: int):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.state_dim = int(state_dim)
+        self.num_state_tokens = int(num_state_tokens)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(self.state_dim),
+            nn.Linear(self.state_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim * self.num_state_tokens),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        tokens = self.mlp(state).view(state.size(0), self.num_state_tokens, self.hidden_dim)
+        return self.norm(tokens)
+
+
 class ConditionalFlowMatchingPredictor(nn.Module):
     def __init__(self, latent_dim: int, hidden_dim: int, condition_dim: int):
         super().__init__()
@@ -354,6 +373,9 @@ class FuturePredVLA(nn.Module):
         policy_conditioning: str = "pooled",
         policy_num_queries: int = 4,
         policy_num_heads: int = 8,
+        state_conditioning: str = "text",
+        robot_state_dim: int = 14,
+        num_state_tokens: int = 2,
     ):
         super().__init__()
         self.backbone = InternVLBackbone(cfg, device=device)
@@ -361,6 +383,17 @@ class FuturePredVLA(nn.Module):
         self.use_future_prediction = bool(use_future_prediction)
         self.action_head_type = str(action_head_type)
         self.policy_conditioning = str(policy_conditioning)
+        self.state_conditioning = str(state_conditioning)
+        if self.state_conditioning == "token":
+            self.state_projector = StateTokenProjector(
+                hidden_dim=self.hidden_dim,
+                state_dim=int(robot_state_dim),
+                num_state_tokens=int(num_state_tokens),
+            )
+        elif self.state_conditioning in {"off", "text"}:
+            self.state_projector = None
+        else:
+            raise RuntimeError(f"Unsupported state_conditioning={self.state_conditioning}. Expected off, text, or token.")
         if self.use_future_prediction:
             self.predictor = ConditionalFlowMatchingPredictor(
                 latent_dim=self.hidden_dim,
@@ -427,25 +460,25 @@ class FuturePredVLA(nn.Module):
                     queue.append(child)
         return None
 
-    def inject_future_tokens(self, future_tokens: torch.Tensor, inject_layer_idx: int):
+    def inject_condition_tokens(self, condition_tokens: torch.Tensor, inject_layer_idx: int):
         layers = self.get_language_layers()
         if layers is None:
-            raise RuntimeError("Could not locate language layers for future-token injection.")
+            raise RuntimeError("Could not locate language layers for condition-token injection.")
         inject_layer_idx = max(0, min(int(inject_layer_idx), len(layers) - 1))
-        future_tokens = future_tokens.to(self.backbone.device)
+        condition_tokens = condition_tokens.to(self.backbone.device)
 
         def _hook(_module, args, output):
             if isinstance(output, tuple):
                 hidden = output[0]
                 remainder = output[1:]
-                tokens = future_tokens.to(hidden.device, dtype=hidden.dtype)
+                tokens = condition_tokens.to(hidden.device, dtype=hidden.dtype)
                 if tokens.size(1) == 1:
                     hidden = hidden + tokens
                 else:
                     prefix = hidden[:, : tokens.size(1), :] + tokens
                     hidden = torch.cat([prefix, hidden[:, tokens.size(1) :, :]], dim=1)
                 return (hidden, *remainder)
-            tokens = future_tokens.to(output.device, dtype=output.dtype)
+            tokens = condition_tokens.to(output.device, dtype=output.dtype)
             if tokens.size(1) == 1:
                 return output + tokens
             prefix = output[:, : tokens.size(1), :] + tokens
@@ -508,12 +541,26 @@ class FuturePredVLA(nn.Module):
         self,
         current_inputs,
         future_inputs=None,
+        robot_state=None,
         actions=None,
         inject_layer_idx: int = 1,
         num_future_samples: int = 4,
         flow_sampling_steps: int = 16,
     ):
-        current_encoded = self.encode_inputs(current_inputs)
+        condition_tokens = []
+        state_tokens = None
+        if self.state_projector is not None and robot_state is not None:
+            state_tokens = self.state_projector(robot_state.to(self.backbone.device).float())
+            condition_tokens.append(state_tokens)
+
+        if condition_tokens:
+            hook = self.inject_condition_tokens(torch.cat(condition_tokens, dim=1), inject_layer_idx=inject_layer_idx)
+            try:
+                current_encoded = self.encode_inputs(current_inputs)
+            finally:
+                hook.remove()
+        else:
+            current_encoded = self.encode_inputs(current_inputs)
         current_state = current_encoded["pooled_state"]
         current_policy_cond, current_policy_tokens = self.build_policy_condition(current_encoded)
 
@@ -534,6 +581,7 @@ class FuturePredVLA(nn.Module):
                 "policy_tokens": current_policy_tokens,
                 "future_samples": None,
                 "future_tokens": None,
+                "state_tokens": state_tokens,
             }
 
         future_target = None
@@ -551,8 +599,11 @@ class FuturePredVLA(nn.Module):
             num_samples=num_future_samples,
         ).to(current_state.dtype)
         _, future_tokens = self.summarize_distribution(future_samples)
+        combined_condition_tokens = [future_tokens]
+        if state_tokens is not None:
+            combined_condition_tokens.insert(0, state_tokens)
 
-        hook = self.inject_future_tokens(future_tokens, inject_layer_idx=inject_layer_idx)
+        hook = self.inject_condition_tokens(torch.cat(combined_condition_tokens, dim=1), inject_layer_idx=inject_layer_idx)
         try:
             conditioned = self.encode_inputs(current_inputs)
         finally:
@@ -585,4 +636,5 @@ class FuturePredVLA(nn.Module):
             "policy_tokens": conditioned_policy_tokens,
             "future_samples": future_samples,
             "future_tokens": future_tokens,
+            "state_tokens": state_tokens,
         }

@@ -33,9 +33,13 @@ accelerate launch --num_processes 4 train.py \
   --future_span "${FUTURE_SPAN:-4}" \
   --image_key "${IMAGE_KEY:-wrist_image_left}" \
   --future_image_key "${FUTURE_IMAGE_KEY:-wrist_image_left}" \
+  --image_keys "${IMAGE_KEYS:-}" \
+  --future_image_keys "${FUTURE_IMAGE_KEYS:-}" \
   --default_prompt "${DEFAULT_PROMPT:-You are controlling a robot from visual observations and task instructions.}" \
-  --include_robot_state \
+  --state_conditioning "${STATE_CONDITIONING:-text}" \
   --robot_state_keys "${ROBOT_STATE_KEYS:-cartesian_position,gripper_position,joint_position}" \
+  --robot_state_dim "${ROBOT_STATE_DIM:-14}" \
+  --num_state_tokens "${NUM_STATE_TOKENS:-2}" \
   --robot_state_precision "${ROBOT_STATE_PRECISION:-4}" \
   --rlds_episode_shuffle_buffer "${RLDS_EPISODE_SHUFFLE_BUFFER:-500000}" \
   --rlds_max_samples_per_episode "${RLDS_MAX_SAMPLES_PER_EPISODE:-64}" \
