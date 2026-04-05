@@ -109,6 +109,9 @@ def parse_args():
     parser.add_argument("--disable_future_prediction", dest="use_future_prediction", action="store_false")
     parser.add_argument("--action_head_type", type=str, default="regression", choices=["regression", "flow"])
     parser.add_argument("--action_flow_hidden_dim", type=int, default=2048)
+    parser.add_argument("--action_flow_num_layers", type=int, default=4)
+    parser.add_argument("--action_flow_num_heads", type=int, default=8)
+    parser.add_argument("--action_flow_dropout", type=float, default=0.1)
     parser.add_argument("--policy_conditioning", type=str, default="pooled", choices=["pooled", "token"])
     parser.add_argument("--policy_num_queries", type=int, default=4)
     parser.add_argument("--policy_num_heads", type=int, default=8)
@@ -230,6 +233,9 @@ def build_model(args, device):
         use_future_prediction=args.use_future_prediction,
         action_head_type=args.action_head_type,
         action_flow_hidden_dim=args.action_flow_hidden_dim,
+        action_flow_num_layers=args.action_flow_num_layers,
+        action_flow_num_heads=args.action_flow_num_heads,
+        action_flow_dropout=args.action_flow_dropout,
         policy_conditioning=args.policy_conditioning,
         policy_num_queries=args.policy_num_queries,
         policy_num_heads=args.policy_num_heads,

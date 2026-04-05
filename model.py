@@ -272,6 +272,133 @@ class ConditionalActionFlowMatchingHead(nn.Module):
         return xt
 
 
+class ActionDiffusionTransformerBlock(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.self_norm = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.ff_norm = nn.LayerNorm(hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, context_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        key_padding_mask = None
+        if context_mask is not None:
+            key_padding_mask = ~context_mask.to(dtype=torch.bool, device=context.device)
+
+        residual = x
+        x_norm = self.self_norm(x)
+        x = residual + self.self_attn(x_norm, x_norm, x_norm, need_weights=False)[0]
+
+        residual = x
+        x_norm = self.cross_norm(x)
+        x = residual + self.cross_attn(
+            query=x_norm,
+            key=context,
+            value=context,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )[0]
+
+        residual = x
+        x = residual + self.ff(self.ff_norm(x))
+        return x
+
+
+class ActionDiffusionTransformerHead(nn.Module):
+    def __init__(
+        self,
+        cond_dim: int,
+        action_dim: int,
+        chunk_horizon: int,
+        model_dim: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.action_dim = int(action_dim)
+        self.chunk_horizon = int(chunk_horizon)
+        self.model_dim = int(model_dim)
+        self.input_proj = nn.Linear(self.action_dim, self.model_dim)
+        self.context_proj = nn.Linear(int(cond_dim), self.model_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, self.model_dim),
+            nn.SiLU(),
+            nn.Linear(self.model_dim, self.model_dim),
+        )
+        self.positional_embedding = nn.Parameter(torch.randn(1, self.chunk_horizon, self.model_dim) * 0.02)
+        self.blocks = nn.ModuleList(
+            [
+                ActionDiffusionTransformerBlock(
+                    hidden_dim=self.model_dim,
+                    num_heads=int(num_heads),
+                    dropout=float(dropout),
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.final_norm = nn.LayerNorm(self.model_dim)
+        self.output_proj = nn.Linear(self.model_dim, self.action_dim)
+
+    def forward(self, xt: torch.Tensor, t: torch.Tensor, context_tokens: torch.Tensor, context_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        hidden = self.input_proj(xt) + self.positional_embedding[:, : xt.size(1), :]
+        hidden = hidden + self.time_mlp(t)[:, None, :]
+        context = self.context_proj(context_tokens)
+        for block in self.blocks:
+            hidden = block(hidden, context=context, context_mask=context_mask)
+        return self.output_proj(self.final_norm(hidden))
+
+    def flow_matching_loss(
+        self,
+        context_tokens: torch.Tensor,
+        target_actions: torch.Tensor,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        noise = torch.randn_like(target_actions)
+        t = torch.rand(target_actions.size(0), 1, device=target_actions.device, dtype=target_actions.dtype)
+        xt = (1.0 - t[:, None, :]) * noise + t[:, None, :] * target_actions
+        velocity_target = target_actions - noise
+        velocity_pred = self.forward(xt, t, context_tokens=context_tokens, context_mask=context_mask)
+        loss = F.mse_loss(velocity_pred, velocity_target)
+        return loss, velocity_pred
+
+    @torch.no_grad()
+    def sample(
+        self,
+        context_tokens: torch.Tensor,
+        num_steps: int,
+        context_mask: Optional[torch.Tensor] = None,
+        noise_scale: float = 1.0,
+    ) -> torch.Tensor:
+        batch = context_tokens.size(0)
+        device = context_tokens.device
+        dtype = context_tokens.dtype
+        xt = noise_scale * torch.randn(batch, self.chunk_horizon, self.action_dim, device=device, dtype=dtype)
+        dt = 1.0 / max(int(num_steps), 1)
+        for step in range(int(num_steps)):
+            t_scalar = (step + 0.5) * dt
+            t = torch.full((batch, 1), fill_value=t_scalar, device=device, dtype=dtype)
+            xt = xt + dt * self.forward(xt, t, context_tokens=context_tokens, context_mask=context_mask)
+        return xt
+
+
 class TokenPolicyConditioner(nn.Module):
     def __init__(self, hidden_dim: int, num_queries: int = 4, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
@@ -370,6 +497,9 @@ class FuturePredVLA(nn.Module):
         use_future_prediction: bool = True,
         action_head_type: str = "regression",
         action_flow_hidden_dim: int = 2048,
+        action_flow_num_layers: int = 4,
+        action_flow_num_heads: int = 8,
+        action_flow_dropout: float = 0.1,
         policy_conditioning: str = "pooled",
         policy_num_queries: int = 4,
         policy_num_heads: int = 8,
@@ -419,11 +549,14 @@ class FuturePredVLA(nn.Module):
         else:
             raise RuntimeError(f"Unsupported policy_conditioning={self.policy_conditioning}. Expected pooled or token.")
         if self.action_head_type == "flow":
-            self.action_head = ConditionalActionFlowMatchingHead(
-                hidden_dim=self.hidden_dim,
+            self.action_head = ActionDiffusionTransformerHead(
+                cond_dim=self.hidden_dim,
                 action_dim=action_dim,
                 chunk_horizon=chunk_horizon,
-                flow_hidden_dim=int(action_flow_hidden_dim),
+                model_dim=int(action_flow_hidden_dim),
+                num_layers=int(action_flow_num_layers),
+                num_heads=int(action_flow_num_heads),
+                dropout=float(action_flow_dropout),
             )
         elif self.action_head_type == "regression":
             self.action_head = ActionChunkHead(
@@ -537,6 +670,14 @@ class FuturePredVLA(nn.Module):
         )
         return conditioned, query_tokens
 
+    def build_action_flow_context(self, encoded: dict, pooled_condition: torch.Tensor, policy_tokens: Optional[torch.Tensor]) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.policy_conditioning == "token":
+            return encoded["sequence_hidden"], encoded.get("attention_mask")
+        if policy_tokens is not None:
+            mask = torch.ones(policy_tokens.size(0), policy_tokens.size(1), device=policy_tokens.device, dtype=torch.long)
+            return policy_tokens, mask
+        return pooled_condition[:, None, :], None
+
     def forward(
         self,
         current_inputs,
@@ -565,9 +706,26 @@ class FuturePredVLA(nn.Module):
         current_policy_cond, current_policy_tokens = self.build_policy_condition(current_encoded)
 
         if not self.use_future_prediction:
+            flow_context_tokens, flow_context_mask = self.build_action_flow_context(
+                encoded=current_encoded,
+                pooled_condition=current_policy_cond,
+                policy_tokens=current_policy_tokens,
+            )
             if self.action_head_type == "flow":
-                pred_actions = self.action_head.sample(current_policy_cond.float(), num_steps=flow_sampling_steps)
-                action_loss, _ = self.action_head.flow_matching_loss(current_policy_cond.float(), actions.float()) if actions is not None else (None, None)
+                pred_actions = self.action_head.sample(
+                    flow_context_tokens.float(),
+                    num_steps=flow_sampling_steps,
+                    context_mask=flow_context_mask,
+                )
+                action_loss, _ = (
+                    self.action_head.flow_matching_loss(
+                        flow_context_tokens.float(),
+                        actions.float(),
+                        context_mask=flow_context_mask,
+                    )
+                    if actions is not None
+                    else (None, None)
+                )
             else:
                 pred_actions = self.action_head(current_policy_cond.float())
                 action_loss = F.smooth_l1_loss(pred_actions, actions.float()) if actions is not None else None
@@ -610,10 +768,27 @@ class FuturePredVLA(nn.Module):
             hook.remove()
         conditioned_state = conditioned["pooled_state"]
         conditioned_policy_cond, conditioned_policy_tokens = self.build_policy_condition(conditioned)
+        flow_context_tokens, flow_context_mask = self.build_action_flow_context(
+            encoded=conditioned,
+            pooled_condition=conditioned_policy_cond,
+            policy_tokens=conditioned_policy_tokens,
+        )
 
         if self.action_head_type == "flow":
-            pred_actions = self.action_head.sample(conditioned_policy_cond.float(), num_steps=flow_sampling_steps)
-            action_loss, _ = self.action_head.flow_matching_loss(conditioned_policy_cond.float(), actions.float()) if actions is not None else (None, None)
+            pred_actions = self.action_head.sample(
+                flow_context_tokens.float(),
+                num_steps=flow_sampling_steps,
+                context_mask=flow_context_mask,
+            )
+            action_loss, _ = (
+                self.action_head.flow_matching_loss(
+                    flow_context_tokens.float(),
+                    actions.float(),
+                    context_mask=flow_context_mask,
+                )
+                if actions is not None
+                else (None, None)
+            )
         else:
             pred_actions = self.action_head(conditioned_policy_cond.float())
             action_loss = F.smooth_l1_loss(pred_actions, actions.float()) if actions is not None else None
