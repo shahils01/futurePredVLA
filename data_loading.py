@@ -157,6 +157,31 @@ def _to_text(value) -> str:
     return str(value)
 
 
+def _format_float_list(values, precision: int = 4) -> str:
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    return ", ".join(f"{float(v):.{precision}f}" for v in arr.tolist())
+
+
+def _extract_robot_state_from_step(step: dict, args):
+    observation = step.get("observation", {}) if isinstance(step, dict) else {}
+    components = []
+    if getattr(args, "include_robot_state", False):
+        for key in getattr(args, "robot_state_keys", []):
+            if key in observation:
+                components.append((key, np.asarray(observation[key], dtype=np.float32)))
+    return components
+
+
+def _build_control_prompt(task_instruction: str, robot_state_components, args) -> str:
+    task_instruction = _to_text(task_instruction).strip() or args.default_prompt
+    lines = [args.default_prompt, f"Task: {task_instruction}"]
+    if getattr(args, "include_robot_state", False) and robot_state_components:
+        state_parts = [f"{name}=[{_format_float_list(values, precision=args.robot_state_precision)}]" for name, values in robot_state_components]
+        lines.append("Robot state: " + "; ".join(state_parts))
+    lines.append("Predict the next robot action chunk from this observation.")
+    return "\n".join(lines)
+
+
 def _np_image_to_pil(value) -> Image.Image:
     array = np.asarray(value)
     if array.ndim != 3:
@@ -409,10 +434,16 @@ class DroidManifestDataset(Dataset):
     def __getitem__(self, index):
         record = dict(self.records[int(index)])
         sample_id = str(_get_first(record, ["id", "sample_id", "uid"], default=index))
-        instruction = str(_get_first(record, ["instruction", "prompt", "language_instruction", "task"], default="What action should the robot take next?"))
+        raw_instruction = str(_get_first(record, ["instruction", "prompt", "language_instruction", "task"], default=""))
         task_name = str(_get_first(record, ["task_name", "task", "skill"], default="droid"))
         current_frames = self._load_clip(record, "current_frame_paths", "current_start_sec", "current_end_sec", self.args.video_frames)
         future_frames = self._load_clip(record, "future_frame_paths", "future_start_sec", "future_end_sec", self.args.future_video_frames)
+        robot_state_components = []
+        if getattr(self.args, "include_robot_state", False):
+            for key in getattr(self.args, "robot_state_keys", []):
+                if key in record:
+                    robot_state_components.append((key, np.asarray(record[key], dtype=np.float32)))
+        instruction = _build_control_prompt(raw_instruction, robot_state_components, self.args)
 
         current_inputs = build_prompt_only_example(self.processor, current_frames, instruction)
         future_inputs = build_prompt_only_example(self.processor, future_frames, instruction)
@@ -551,8 +582,8 @@ class DroidRLDSDataset(IterableDataset):
                     instruction = _to_text(steps[step_idx].get(key))
                     if instruction:
                         break
-                if not instruction:
-                    instruction = "What action should the robot take next?"
+                robot_state_components = _extract_robot_state_from_step(steps[step_idx], self.args)
+                instruction = _build_control_prompt(instruction, robot_state_components, self.args)
 
                 actions = np.stack(
                     [np.asarray(steps[idx]["action"], dtype=np.float32) for idx in range(step_idx, step_idx + int(self.args.chunk_horizon))],

@@ -60,6 +60,10 @@ def parse_args():
     parser.add_argument("--rlds_dataset_name", type=str, default="r2d2_faceblur")
     parser.add_argument("--image_key", type=str, default="wrist_image_left")
     parser.add_argument("--future_image_key", type=str, default="wrist_image_left")
+    parser.add_argument("--default_prompt", type=str, default="You are controlling a robot from visual observations and task instructions.")
+    parser.add_argument("--include_robot_state", action="store_true")
+    parser.add_argument("--robot_state_keys", type=str, default="cartesian_position,gripper_position,joint_position")
+    parser.add_argument("--robot_state_precision", type=int, default=4)
     parser.add_argument("--rlds_episode_shuffle_buffer", type=int, default=500000)
     parser.add_argument("--rlds_shuffle_steps", action="store_true", default=True)
     parser.add_argument("--no_rlds_shuffle_steps", dest="rlds_shuffle_steps", action="store_false")
@@ -371,6 +375,7 @@ def _set_loader_epoch(loader, epoch: int):
 
 def main():
     args = parse_args()
+    args.robot_state_keys = [item.strip() for item in str(args.robot_state_keys).split(",") if item.strip()]
     os.makedirs(args.save_dir, exist_ok=True)
 
     if args.peft == "qlora" and args.fsdp:

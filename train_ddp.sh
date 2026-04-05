@@ -26,13 +26,17 @@ accelerate launch --num_processes 4 train.py \
   --vl_model_name "$VL_MODEL_NAME" \
   --batch_size "${BATCH_SIZE:-1}" \
   --num_workers "${NUM_WORKERS:-1}" \
-  --video_frames "${VIDEO_FRAMES:-4}" \
+  --video_frames "${VIDEO_FRAMES:-8}" \
   --future_video_frames "${FUTURE_VIDEO_FRAMES:-4}" \
   --current_history "${CURRENT_HISTORY:-4}" \
   --future_offset "${FUTURE_OFFSET:-8}" \
   --future_span "${FUTURE_SPAN:-4}" \
   --image_key "${IMAGE_KEY:-wrist_image_left}" \
   --future_image_key "${FUTURE_IMAGE_KEY:-wrist_image_left}" \
+  --default_prompt "${DEFAULT_PROMPT:-You are controlling a robot from visual observations and task instructions.}" \
+  --include_robot_state \
+  --robot_state_keys "${ROBOT_STATE_KEYS:-cartesian_position,gripper_position,joint_position}" \
+  --robot_state_precision "${ROBOT_STATE_PRECISION:-4}" \
   --rlds_episode_shuffle_buffer "${RLDS_EPISODE_SHUFFLE_BUFFER:-500000}" \
   --rlds_max_samples_per_episode "${RLDS_MAX_SAMPLES_PER_EPISODE:-64}" \
   --normalize_actions \
