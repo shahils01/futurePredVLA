@@ -102,6 +102,9 @@ def parse_args():
 
     parser.add_argument("--predictor_hidden_dim", type=int, default=2048)
     parser.add_argument("--num_future_tokens", type=int, default=2)
+    parser.add_argument("--future_model_num_layers", type=int, default=4)
+    parser.add_argument("--future_model_num_heads", type=int, default=8)
+    parser.add_argument("--future_model_dropout", type=float, default=0.1)
     parser.add_argument("--inject_layer_idx", type=int, default=1)
     parser.add_argument("--num_future_samples", type=int, default=4)
     parser.add_argument("--flow_sampling_steps", type=int, default=16)
@@ -236,6 +239,9 @@ def build_model(args, device):
         action_flow_num_layers=args.action_flow_num_layers,
         action_flow_num_heads=args.action_flow_num_heads,
         action_flow_dropout=args.action_flow_dropout,
+        future_model_num_layers=args.future_model_num_layers,
+        future_model_num_heads=args.future_model_num_heads,
+        future_model_dropout=args.future_model_dropout,
         policy_conditioning=args.policy_conditioning,
         policy_num_queries=args.policy_num_queries,
         policy_num_heads=args.policy_num_heads,

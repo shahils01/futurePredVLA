@@ -4,6 +4,7 @@ import os
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 
 try:
@@ -136,6 +137,9 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
         "action_mse_sum": torch.zeros(1, device=accelerator.device),
         "action_mae_denorm_sum": torch.zeros(1, device=accelerator.device),
         "action_mse_denorm_sum": torch.zeros(1, device=accelerator.device),
+        "future_token_mae_sum": torch.zeros(1, device=accelerator.device),
+        "future_token_mse_sum": torch.zeros(1, device=accelerator.device),
+        "future_token_cosine_sum": torch.zeros(1, device=accelerator.device),
         "examples": torch.zeros(1, device=accelerator.device),
     }
     running = {
@@ -146,6 +150,9 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
         "action_mse_sum": 0.0,
         "action_mae_denorm_sum": 0.0,
         "action_mse_denorm_sum": 0.0,
+        "future_token_mae_sum": 0.0,
+        "future_token_mse_sum": 0.0,
+        "future_token_cosine_sum": 0.0,
         "examples": 0.0,
     }
 
@@ -185,6 +192,21 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
             actions_denorm = _denormalize(actions, action_stats)
             action_mae_denorm = (pred_actions_denorm - actions_denorm).abs().mean()
             action_mse_denorm = ((pred_actions_denorm - actions_denorm) ** 2).mean()
+            future_samples = outputs.get("future_samples")
+            future_target_tokens = outputs.get("future_target_tokens")
+            if future_samples is not None and future_target_tokens is not None:
+                future_pred_mean = future_samples.mean(dim=1)
+                future_token_mae = (future_pred_mean - future_target_tokens).abs().mean()
+                future_token_mse = ((future_pred_mean - future_target_tokens) ** 2).mean()
+                future_token_cosine = F.cosine_similarity(
+                    future_pred_mean.reshape(future_pred_mean.size(0), -1),
+                    future_target_tokens.reshape(future_target_tokens.size(0), -1),
+                    dim=-1,
+                ).mean()
+            else:
+                future_token_mae = torch.zeros((), device=accelerator.device)
+                future_token_mse = torch.zeros((), device=accelerator.device)
+                future_token_cosine = torch.zeros((), device=accelerator.device)
 
             loss = outputs["loss"] if outputs["loss"] is not None else torch.zeros((), device=accelerator.device)
             action_loss = outputs["action_loss"] if outputs["action_loss"] is not None else torch.zeros((), device=accelerator.device)
@@ -199,6 +221,9 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
                     float(action_mse.item()) * batch_size,
                     float(action_mae_denorm.item()) * batch_size,
                     float(action_mse_denorm.item()) * batch_size,
+                    float(future_token_mae.item()) * batch_size,
+                    float(future_token_mse.item()) * batch_size,
+                    float(future_token_cosine.item()) * batch_size,
                     float(batch_size),
                 ],
                 device=accelerator.device,
@@ -212,7 +237,10 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
                 metrics["action_mse_sum"] += gathered[4:5]
                 metrics["action_mae_denorm_sum"] += gathered[5:6]
                 metrics["action_mse_denorm_sum"] += gathered[6:7]
-                metrics["examples"] += gathered[7:8]
+                metrics["future_token_mae_sum"] += gathered[7:8]
+                metrics["future_token_mse_sum"] += gathered[8:9]
+                metrics["future_token_cosine_sum"] += gathered[9:10]
+                metrics["examples"] += gathered[10:11]
                 running["loss_sum"] += float(gathered[0].item())
                 running["action_loss_sum"] += float(gathered[1].item())
                 running["future_loss_sum"] += float(gathered[2].item())
@@ -220,7 +248,10 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
                 running["action_mse_sum"] += float(gathered[4].item())
                 running["action_mae_denorm_sum"] += float(gathered[5].item())
                 running["action_mse_denorm_sum"] += float(gathered[6].item())
-                running["examples"] += float(gathered[7].item())
+                running["future_token_mae_sum"] += float(gathered[7].item())
+                running["future_token_mse_sum"] += float(gathered[8].item())
+                running["future_token_cosine_sum"] += float(gathered[9].item())
+                running["examples"] += float(gathered[10].item())
 
             if args.log_every > 0 and step % args.log_every == 0:
                 if accelerator.is_main_process:
@@ -232,7 +263,9 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
                         f"action={running['action_loss_sum'] / denom:.4f} "
                         f"future={running['future_loss_sum'] / denom:.4f} "
                         f"mae={running['action_mae_sum'] / denom:.4f} "
-                        f"mae_denorm={running['action_mae_denorm_sum'] / denom:.4f}"
+                        f"mae_denorm={running['action_mae_denorm_sum'] / denom:.4f} "
+                        f"future_tok_mae={running['future_token_mae_sum'] / denom:.4f} "
+                        f"future_tok_cos={running['future_token_cosine_sum'] / denom:.4f}"
                     )
 
     if not accelerator.is_main_process:
@@ -249,6 +282,9 @@ def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
         "action_mse": float(metrics["action_mse_sum"].item() / examples),
         "action_mae_denorm": float(metrics["action_mae_denorm_sum"].item() / examples),
         "action_mse_denorm": float(metrics["action_mse_denorm_sum"].item() / examples),
+        "future_token_mae": float(metrics["future_token_mae_sum"].item() / examples),
+        "future_token_mse": float(metrics["future_token_mse_sum"].item() / examples),
+        "future_token_cosine": float(metrics["future_token_cosine_sum"].item() / examples),
         "checkpoint_path": args.checkpoint_path,
     }
 

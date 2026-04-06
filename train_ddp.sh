@@ -51,6 +51,9 @@ accelerate launch --num_processes 2 train.py \
   --action_dim "${ACTION_DIM:-7}" \
   --predictor_hidden_dim "${PREDICTOR_HIDDEN_DIM:-2048}" \
   --num_future_tokens "${NUM_FUTURE_TOKENS:-2}" \
+  --future_model_num_layers "${FUTURE_MODEL_NUM_LAYERS:-4}" \
+  --future_model_num_heads "${FUTURE_MODEL_NUM_HEADS:-8}" \
+  --future_model_dropout "${FUTURE_MODEL_DROPOUT:-0.1}" \
   --num_future_samples "${NUM_FUTURE_SAMPLES:-4}" \
   --flow_sampling_steps "${FLOW_SAMPLING_STEPS:-16}" \
   --action_head_type "${ACTION_HEAD_TYPE:-regression}" \

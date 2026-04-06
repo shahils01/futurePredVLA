@@ -204,6 +204,61 @@ class ConditionalFlowMatchingPredictor(nn.Module):
         return xt.view(batch, num_samples, dim)
 
 
+class FutureTokenTrajectoryEncoder(nn.Module):
+    def __init__(self, hidden_dim: int, num_future_tokens: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.num_future_tokens = int(num_future_tokens)
+        self.query_tokens = nn.Parameter(torch.randn(1, self.num_future_tokens, self.hidden_dim) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=int(num_heads),
+            dim_feedforward=4 * self.hidden_dim,
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.norm = nn.LayerNorm(self.hidden_dim)
+
+    def forward(self, sequence_hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        batch = sequence_hidden.size(0)
+        queries = self.query_tokens.expand(batch, -1, -1)
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = ~attention_mask.to(dtype=torch.bool, device=sequence_hidden.device)
+        attended, _ = self.cross_attn(
+            query=queries,
+            key=sequence_hidden,
+            value=sequence_hidden,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return self.norm(self.encoder(attended))
+
+
+class FutureDistributionSummary(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, future_samples: torch.Tensor) -> torch.Tensor:
+        mean = future_samples.mean(dim=1)
+        std = future_samples.std(dim=1, unbiased=False)
+        return self.norm(self.net(torch.cat([mean, std], dim=-1)))
+
+
 class ActionChunkHead(nn.Module):
     def __init__(self, hidden_dim: int, action_dim: int, chunk_horizon: int, dropout: float = 0.1):
         super().__init__()
@@ -403,6 +458,140 @@ class ActionDiffusionTransformerHead(nn.Module):
         return xt
 
 
+class FutureDiffusionTransformerBlock(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.self_norm = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.ff_norm = nn.LayerNorm(hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, context_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        key_padding_mask = None
+        if context_mask is not None:
+            key_padding_mask = ~context_mask.to(dtype=torch.bool, device=context.device)
+        residual = x
+        x_norm = self.self_norm(x)
+        x = residual + self.self_attn(x_norm, x_norm, x_norm, need_weights=False)[0]
+        residual = x
+        x_norm = self.cross_norm(x)
+        x = residual + self.cross_attn(
+            query=x_norm,
+            key=context,
+            value=context,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )[0]
+        residual = x
+        x = residual + self.ff(self.ff_norm(x))
+        return x
+
+
+class FutureTrajectoryDiffusionTransformer(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_future_tokens: int,
+        model_dim: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.num_future_tokens = int(num_future_tokens)
+        self.model_dim = int(model_dim)
+        self.input_proj = nn.Linear(self.hidden_dim, self.model_dim)
+        self.context_proj = nn.Linear(self.hidden_dim, self.model_dim)
+        self.output_proj = nn.Linear(self.model_dim, self.hidden_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, self.model_dim),
+            nn.SiLU(),
+            nn.Linear(self.model_dim, self.model_dim),
+        )
+        self.positional_embedding = nn.Parameter(torch.randn(1, self.num_future_tokens, self.model_dim) * 0.02)
+        self.blocks = nn.ModuleList(
+            [
+                FutureDiffusionTransformerBlock(
+                    hidden_dim=self.model_dim,
+                    num_heads=int(num_heads),
+                    dropout=float(dropout),
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.final_norm = nn.LayerNorm(self.model_dim)
+
+    def forward(self, xt: torch.Tensor, t: torch.Tensor, context_tokens: torch.Tensor, context_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        hidden = self.input_proj(xt) + self.positional_embedding[:, : xt.size(1), :]
+        hidden = hidden + self.time_mlp(t)[:, None, :]
+        context = self.context_proj(context_tokens)
+        for block in self.blocks:
+            hidden = block(hidden, context=context, context_mask=context_mask)
+        return self.output_proj(self.final_norm(hidden))
+
+    def flow_matching_loss(
+        self,
+        context_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        noise = torch.randn_like(target_tokens)
+        t = torch.rand(target_tokens.size(0), 1, device=target_tokens.device, dtype=target_tokens.dtype)
+        xt = (1.0 - t[:, None, :]) * noise + t[:, None, :] * target_tokens
+        velocity_target = target_tokens - noise
+        velocity_pred = self.forward(xt, t, context_tokens=context_tokens, context_mask=context_mask)
+        loss = F.mse_loss(velocity_pred, velocity_target)
+        return loss, velocity_pred
+
+    @torch.no_grad()
+    def sample(
+        self,
+        context_tokens: torch.Tensor,
+        num_steps: int,
+        num_samples: int,
+        context_mask: Optional[torch.Tensor] = None,
+        noise_scale: float = 1.0,
+    ) -> torch.Tensor:
+        batch = context_tokens.size(0)
+        device = context_tokens.device
+        dtype = context_tokens.dtype
+        context_rep = context_tokens[:, None, :, :].expand(batch, num_samples, context_tokens.size(1), context_tokens.size(2))
+        context_rep = context_rep.reshape(batch * num_samples, context_tokens.size(1), context_tokens.size(2))
+        if context_mask is not None:
+            context_mask = context_mask[:, None, :].expand(batch, num_samples, context_mask.size(1)).reshape(batch * num_samples, context_mask.size(1))
+        xt = noise_scale * torch.randn(
+            batch * num_samples,
+            self.num_future_tokens,
+            self.hidden_dim,
+            device=device,
+            dtype=dtype,
+        )
+        dt = 1.0 / max(int(num_steps), 1)
+        for step in range(int(num_steps)):
+            t_scalar = (step + 0.5) * dt
+            t = torch.full((xt.size(0), 1), fill_value=t_scalar, device=device, dtype=dtype)
+            xt = xt + dt * self.forward(xt, t, context_tokens=context_rep, context_mask=context_mask)
+        return xt.view(batch, num_samples, self.num_future_tokens, self.hidden_dim)
+
+
 class TokenPolicyConditioner(nn.Module):
     def __init__(self, hidden_dim: int, num_queries: int = 4, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
@@ -504,6 +693,9 @@ class FuturePredVLA(nn.Module):
         action_flow_num_layers: int = 4,
         action_flow_num_heads: int = 8,
         action_flow_dropout: float = 0.1,
+        future_model_num_layers: int = 4,
+        future_model_num_heads: int = 8,
+        future_model_dropout: float = 0.1,
         policy_conditioning: str = "pooled",
         policy_num_queries: int = 4,
         policy_num_heads: int = 8,
@@ -518,6 +710,7 @@ class FuturePredVLA(nn.Module):
         self.action_head_type = str(action_head_type)
         self.policy_conditioning = str(policy_conditioning)
         self.state_conditioning = str(state_conditioning)
+        self.num_future_tokens = int(num_future_tokens)
         if self.state_conditioning == "token":
             self.state_projector = StateTokenProjector(
                 hidden_dim=self.hidden_dim,
@@ -529,17 +722,23 @@ class FuturePredVLA(nn.Module):
         else:
             raise RuntimeError(f"Unsupported state_conditioning={self.state_conditioning}. Expected off, text, or token.")
         if self.use_future_prediction:
-            self.predictor = ConditionalFlowMatchingPredictor(
-                latent_dim=self.hidden_dim,
-                hidden_dim=int(predictor_hidden_dim),
-                condition_dim=self.hidden_dim,
-            )
-            self.projector = FutureTokenProjector(
+            self.future_tokenizer = FutureTokenTrajectoryEncoder(
                 hidden_dim=self.hidden_dim,
-                latent_dim=self.hidden_dim,
-                num_future_tokens=num_future_tokens,
+                num_future_tokens=int(num_future_tokens),
+                num_heads=int(future_model_num_heads),
+                dropout=float(future_model_dropout),
             )
+            self.predictor = FutureTrajectoryDiffusionTransformer(
+                hidden_dim=self.hidden_dim,
+                num_future_tokens=num_future_tokens,
+                model_dim=int(predictor_hidden_dim),
+                num_layers=int(future_model_num_layers),
+                num_heads=int(future_model_num_heads),
+                dropout=float(future_model_dropout),
+            )
+            self.projector = FutureDistributionSummary(hidden_dim=self.hidden_dim)
         else:
+            self.future_tokenizer = None
             self.predictor = None
             self.projector = None
         if self.policy_conditioning == "token":
@@ -662,21 +861,43 @@ class FuturePredVLA(nn.Module):
         mean = future_samples.mean(dim=1)
         std = future_samples.std(dim=1, unbiased=False)
         stats = torch.cat([mean, std], dim=-1)
-        tokens = self.projector(stats)
+        tokens = self.projector(future_samples)
         return stats, tokens
 
     def build_policy_condition(self, encoded: dict) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self.policy_conditioner is None:
-            return encoded["pooled_state"], None
-        conditioned, query_tokens = self.policy_conditioner(
+        return self.build_policy_condition_from_tokens(
             sequence_hidden=encoded["sequence_hidden"],
             attention_mask=encoded.get("attention_mask"),
+            pooled_fallback=encoded["pooled_state"],
+        )
+
+    def build_policy_condition_from_tokens(
+        self,
+        sequence_hidden: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        pooled_fallback: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.policy_conditioner is None:
+            if attention_mask is None:
+                return sequence_hidden.mean(dim=1), None
+            mask = attention_mask.to(dtype=sequence_hidden.dtype, device=sequence_hidden.device)[:, :, None]
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            return (sequence_hidden * mask).sum(dim=1) / denom, None
+        conditioned, query_tokens = self.policy_conditioner(
+            sequence_hidden=sequence_hidden,
+            attention_mask=attention_mask,
         )
         return conditioned, query_tokens
 
-    def build_action_flow_context(self, encoded: dict, pooled_condition: torch.Tensor, policy_tokens: Optional[torch.Tensor]) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def build_action_flow_context(
+        self,
+        sequence_hidden: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        pooled_condition: torch.Tensor,
+        policy_tokens: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.policy_conditioning == "token":
-            return encoded["sequence_hidden"], encoded.get("attention_mask")
+            return sequence_hidden, attention_mask
         if policy_tokens is not None:
             mask = torch.ones(policy_tokens.size(0), policy_tokens.size(1), device=policy_tokens.device, dtype=torch.long)
             return policy_tokens, mask
@@ -712,7 +933,8 @@ class FuturePredVLA(nn.Module):
 
         if not self.use_future_prediction:
             flow_context_tokens, flow_context_mask = self.build_action_flow_context(
-                encoded=current_encoded,
+                sequence_hidden=current_encoded["sequence_hidden"],
+                attention_mask=current_encoded.get("attention_mask"),
                 pooled_condition=current_policy_cond,
                 policy_tokens=current_policy_tokens,
             )
@@ -754,35 +976,49 @@ class FuturePredVLA(nn.Module):
                     future_state_tokens = self.state_projector(future_robot_state.to(self.backbone.device).float())
                     future_hook = self.inject_condition_tokens(future_state_tokens, inject_layer_idx=inject_layer_idx)
                     try:
-                        future_target = self.encode_inputs(future_inputs)["pooled_state"].detach()
+                        future_encoded = self.encode_inputs(future_inputs)
                     finally:
                         future_hook.remove()
                 else:
-                    future_target = self.encode_inputs(future_inputs)["pooled_state"].detach()
+                    future_encoded = self.encode_inputs(future_inputs)
+                future_target = self.future_tokenizer(
+                    sequence_hidden=future_encoded["sequence_hidden"],
+                    attention_mask=future_encoded.get("attention_mask"),
+                ).detach()
 
         future_loss = None
         if future_target is not None:
-            future_loss = self.predictor.flow_matching_loss(current_state.float(), future_target.float())
+            future_loss, _ = self.predictor.flow_matching_loss(
+                context_tokens=current_encoded["sequence_hidden"].float(),
+                target_tokens=future_target.float(),
+                context_mask=current_encoded.get("attention_mask"),
+            )
 
         future_samples = self.predictor.sample(
-            cond=current_state.float(),
+            context_tokens=current_encoded["sequence_hidden"].float(),
             num_steps=flow_sampling_steps,
             num_samples=num_future_samples,
-        ).to(current_state.dtype)
+            context_mask=current_encoded.get("attention_mask"),
+        ).to(current_encoded["sequence_hidden"].dtype)
         _, future_tokens = self.summarize_distribution(future_samples)
-        combined_condition_tokens = [future_tokens]
-        if state_tokens is not None:
-            combined_condition_tokens.insert(0, state_tokens)
-
-        hook = self.inject_condition_tokens(torch.cat(combined_condition_tokens, dim=1), inject_layer_idx=inject_layer_idx)
-        try:
-            conditioned = self.encode_inputs(current_inputs)
-        finally:
-            hook.remove()
-        conditioned_state = conditioned["pooled_state"]
-        conditioned_policy_cond, conditioned_policy_tokens = self.build_policy_condition(conditioned)
+        conditioned_sequence = torch.cat([current_encoded["sequence_hidden"], future_tokens], dim=1)
+        conditioned_mask = None
+        if current_encoded.get("attention_mask") is not None:
+            future_mask = torch.ones(
+                future_tokens.size(0),
+                future_tokens.size(1),
+                device=future_tokens.device,
+                dtype=current_encoded["attention_mask"].dtype,
+            )
+            conditioned_mask = torch.cat([current_encoded["attention_mask"], future_mask], dim=1)
+        conditioned_policy_cond, conditioned_policy_tokens = self.build_policy_condition_from_tokens(
+            sequence_hidden=conditioned_sequence,
+            attention_mask=conditioned_mask,
+            pooled_fallback=current_state,
+        )
         flow_context_tokens, flow_context_mask = self.build_action_flow_context(
-            encoded=conditioned,
+            sequence_hidden=conditioned_sequence,
+            attention_mask=conditioned_mask,
             pooled_condition=conditioned_policy_cond,
             policy_tokens=conditioned_policy_tokens,
         )
@@ -822,7 +1058,10 @@ class FuturePredVLA(nn.Module):
             "current_state": current_state,
             "policy_condition": conditioned_policy_cond,
             "policy_tokens": conditioned_policy_tokens,
+            "current_sequence_hidden": current_encoded["sequence_hidden"],
+            "conditioned_sequence_hidden": conditioned_sequence,
             "future_samples": future_samples,
+            "future_target_tokens": future_target,
             "future_tokens": future_tokens,
             "state_tokens": state_tokens,
         }
