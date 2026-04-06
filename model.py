@@ -153,7 +153,11 @@ class StateTokenProjector(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        tokens = self.mlp(state).view(state.size(0), self.num_state_tokens, self.hidden_dim)
+        if state.dim() == 2:
+            state = state[:, None, :]
+        batch, num_steps, _ = state.shape
+        flat_state = state.reshape(batch * num_steps, self.state_dim)
+        tokens = self.mlp(flat_state).view(batch, num_steps * self.num_state_tokens, self.hidden_dim)
         return self.norm(tokens)
 
 

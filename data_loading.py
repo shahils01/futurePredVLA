@@ -187,6 +187,16 @@ def _flatten_robot_state_components(robot_state_components, expected_dim: int) -
     return torch.tensor(flat, dtype=torch.float32)
 
 
+def _extract_robot_state_vector_from_step(step: dict, args) -> torch.Tensor:
+    return _flatten_robot_state_components(_extract_robot_state_from_step(step, args), args.robot_state_dim)
+
+
+def _stack_state_trajectory(state_vectors) -> torch.Tensor:
+    if not state_vectors:
+        raise RuntimeError("Expected at least one robot state vector to build a trajectory.")
+    return torch.stack(state_vectors, dim=0)
+
+
 def _build_control_prompt(task_instruction: str, robot_state_components, args) -> str:
     task_instruction = _to_text(task_instruction).strip() or args.default_prompt
     lines = [args.default_prompt, f"Task: {task_instruction}"]
@@ -493,8 +503,12 @@ class DroidManifestDataset(Dataset):
                     future_robot_state_components.append((key, np.asarray(record[future_key], dtype=np.float32)))
                 elif key in record:
                     future_robot_state_components.append((key, np.asarray(record[key], dtype=np.float32)))
-        current_robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
-        future_robot_state = _flatten_robot_state_components(future_robot_state_components, self.args.robot_state_dim)
+        current_robot_state = _stack_state_trajectory(
+            [_flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)]
+        )
+        future_robot_state = _stack_state_trajectory(
+            [_flatten_robot_state_components(future_robot_state_components, self.args.robot_state_dim)]
+        )
         current_instruction = _build_control_prompt(raw_instruction, robot_state_components, self.args)
         future_instruction = _build_control_prompt(raw_instruction, future_robot_state_components, self.args)
 
@@ -639,8 +653,12 @@ class DroidRLDSDataset(IterableDataset):
                         break
                 robot_state_components = _extract_robot_state_from_step(steps[step_idx], self.args)
                 future_robot_state_components = _extract_robot_state_from_step(steps[future_begin], self.args)
-                current_robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
-                future_robot_state = _flatten_robot_state_components(future_robot_state_components, self.args.robot_state_dim)
+                current_robot_state = _stack_state_trajectory(
+                    [_extract_robot_state_vector_from_step(steps[int(idx)], self.args) for idx in current_indices]
+                )
+                future_robot_state = _stack_state_trajectory(
+                    [_extract_robot_state_vector_from_step(steps[int(idx)], self.args) for idx in future_indices]
+                )
                 current_instruction = _build_control_prompt(instruction, robot_state_components, self.args)
                 future_instruction = _build_control_prompt(instruction, future_robot_state_components, self.args)
 
