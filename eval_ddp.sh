@@ -19,5 +19,5 @@ accelerate launch --num_processes "${NUM_PROCESSES:-1}" eval.py \
   --mixed_precision "${MIXED_PRECISION:-bf16}" \
   --metrics_path "${METRICS_PATH:-}" \
   --max_eval_batches "${MAX_EVAL_BATCHES:-0}" \
-  --log_every "${LOG_EVERY:-20}" \
+  --log_every "${LOG_EVERY:-100}" \
   "$@"
