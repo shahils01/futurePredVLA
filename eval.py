@@ -126,7 +126,7 @@ def _denormalize(actions: torch.Tensor, action_stats):
     return actions * std + mean
 
 
-def evaluate(model, loader, accelerator, args, action_stats):
+def evaluate(model, loader, accelerator, args, action_stats, eval_mode: str):
     model.eval()
     metrics = {
         "loss_sum": torch.zeros(1, device=accelerator.device),
@@ -240,7 +240,7 @@ def evaluate(model, loader, accelerator, args, action_stats):
 
     examples = max(float(metrics["examples"].item()), 1.0)
     return {
-        "eval_mode": args.eval_mode,
+        "eval_mode": str(eval_mode),
         "examples": int(metrics["examples"].item()),
         "loss": float(metrics["loss_sum"].item() / examples),
         "action_loss": float(metrics["action_loss_sum"].item() / examples),
@@ -275,7 +275,7 @@ def main():
     _set_loader_epoch(loader, 0)
 
     accelerator.print(f"evaluating checkpoint={cli_args.checkpoint_path} mode={cli_args.eval_mode}")
-    metrics = evaluate(model, loader, accelerator, args, action_stats)
+    metrics = evaluate(model, loader, accelerator, args, action_stats, eval_mode=cli_args.eval_mode)
     if not accelerator.is_main_process:
         return
 
