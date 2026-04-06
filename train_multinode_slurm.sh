@@ -7,6 +7,7 @@ ANNOTATION_PATH="${ANNOTATION_PATH:-}"
 MEDIA_ROOT="${MEDIA_ROOT:-}"
 DATA_ROOT="${DATA_ROOT:-}"
 SAVE_DIR="${SAVE_DIR:-checkpoints_future_pred_vla}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NNODES="${NNODES:-${SLURM_NNODES:-5}}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
@@ -31,7 +32,7 @@ if [[ "$DATASET_TYPE" == "droid_rlds" && -z "$DATA_ROOT" ]]; then
 fi
 
 TRAIN_CMD=$(cat <<EOF
-cd /home/i2r/shahil_ws/futurePredVLA
+cd ${SCRIPT_DIR}
 torchrun \
   --nnodes=${NNODES} \
   --nproc_per_node=${GPUS_PER_NODE} \
