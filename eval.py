@@ -138,6 +138,16 @@ def evaluate(model, loader, accelerator, args, action_stats):
         "action_mse_denorm_sum": torch.zeros(1, device=accelerator.device),
         "examples": torch.zeros(1, device=accelerator.device),
     }
+    running = {
+        "loss_sum": 0.0,
+        "action_loss_sum": 0.0,
+        "future_loss_sum": 0.0,
+        "action_mae_sum": 0.0,
+        "action_mse_sum": 0.0,
+        "action_mae_denorm_sum": 0.0,
+        "action_mse_denorm_sum": 0.0,
+        "examples": 0.0,
+    }
 
     max_eval_batches = int(getattr(args, "max_eval_batches", 0))
     with torch.no_grad():
@@ -203,9 +213,27 @@ def evaluate(model, loader, accelerator, args, action_stats):
                 metrics["action_mae_denorm_sum"] += gathered[5:6]
                 metrics["action_mse_denorm_sum"] += gathered[6:7]
                 metrics["examples"] += gathered[7:8]
+                running["loss_sum"] += float(gathered[0].item())
+                running["action_loss_sum"] += float(gathered[1].item())
+                running["future_loss_sum"] += float(gathered[2].item())
+                running["action_mae_sum"] += float(gathered[3].item())
+                running["action_mse_sum"] += float(gathered[4].item())
+                running["action_mae_denorm_sum"] += float(gathered[5].item())
+                running["action_mse_denorm_sum"] += float(gathered[6].item())
+                running["examples"] += float(gathered[7].item())
 
             if args.log_every > 0 and step % args.log_every == 0:
-                accelerator.print(f"eval step={step}")
+                if accelerator.is_main_process:
+                    denom = max(running["examples"], 1.0)
+                    accelerator.print(
+                        "eval "
+                        f"step={step} "
+                        f"loss={running['loss_sum'] / denom:.4f} "
+                        f"action={running['action_loss_sum'] / denom:.4f} "
+                        f"future={running['future_loss_sum'] / denom:.4f} "
+                        f"mae={running['action_mae_sum'] / denom:.4f} "
+                        f"mae_denorm={running['action_mae_denorm_sum'] / denom:.4f}"
+                    )
 
     if not accelerator.is_main_process:
         return None
