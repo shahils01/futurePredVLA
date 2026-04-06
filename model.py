@@ -683,6 +683,7 @@ class FuturePredVLA(nn.Module):
         current_inputs,
         future_inputs=None,
         robot_state=None,
+        future_robot_state=None,
         actions=None,
         inject_layer_idx: int = 1,
         num_future_samples: int = 4,
@@ -745,7 +746,15 @@ class FuturePredVLA(nn.Module):
         future_target = None
         if future_inputs is not None:
             with torch.no_grad():
-                future_target = self.encode_inputs(future_inputs)["pooled_state"].detach()
+                if self.state_projector is not None and future_robot_state is not None:
+                    future_state_tokens = self.state_projector(future_robot_state.to(self.backbone.device).float())
+                    future_hook = self.inject_condition_tokens(future_state_tokens, inject_layer_idx=inject_layer_idx)
+                    try:
+                        future_target = self.encode_inputs(future_inputs)["pooled_state"].detach()
+                    finally:
+                        future_hook.remove()
+                else:
+                    future_target = self.encode_inputs(future_inputs)["pooled_state"].detach()
 
         future_loss = None
         if future_target is not None:

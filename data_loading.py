@@ -485,11 +485,21 @@ class DroidManifestDataset(Dataset):
             for key in getattr(self.args, "robot_state_keys", []):
                 if key in record:
                     robot_state_components.append((key, np.asarray(record[key], dtype=np.float32)))
-        robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
-        instruction = _build_control_prompt(raw_instruction, robot_state_components, self.args)
+        future_robot_state_components = []
+        if getattr(self.args, "include_robot_state", False):
+            for key in getattr(self.args, "robot_state_keys", []):
+                future_key = f"future_{key}"
+                if future_key in record:
+                    future_robot_state_components.append((key, np.asarray(record[future_key], dtype=np.float32)))
+                elif key in record:
+                    future_robot_state_components.append((key, np.asarray(record[key], dtype=np.float32)))
+        current_robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
+        future_robot_state = _flatten_robot_state_components(future_robot_state_components, self.args.robot_state_dim)
+        current_instruction = _build_control_prompt(raw_instruction, robot_state_components, self.args)
+        future_instruction = _build_control_prompt(raw_instruction, future_robot_state_components, self.args)
 
-        current_inputs = build_prompt_only_example(self.processor, current_frames, instruction)
-        future_inputs = build_prompt_only_example(self.processor, future_frames, instruction)
+        current_inputs = build_prompt_only_example(self.processor, current_frames, current_instruction)
+        future_inputs = build_prompt_only_example(self.processor, future_frames, future_instruction)
 
         actions = _get_first(record, ["actions", "action_chunk", "future_actions"])
         if isinstance(actions, str):
@@ -512,10 +522,11 @@ class DroidManifestDataset(Dataset):
         return {
             "id": sample_id,
             "task_name": task_name,
-            "instruction": instruction,
+            "instruction": current_instruction,
             "current_inputs": current_inputs,
             "future_inputs": future_inputs,
-            "robot_state": robot_state,
+            "current_robot_state": current_robot_state,
+            "future_robot_state": future_robot_state,
             "actions": actions,
         }
 
@@ -627,8 +638,11 @@ class DroidRLDSDataset(IterableDataset):
                     if instruction:
                         break
                 robot_state_components = _extract_robot_state_from_step(steps[step_idx], self.args)
-                robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
-                instruction = _build_control_prompt(instruction, robot_state_components, self.args)
+                future_robot_state_components = _extract_robot_state_from_step(steps[future_begin], self.args)
+                current_robot_state = _flatten_robot_state_components(robot_state_components, self.args.robot_state_dim)
+                future_robot_state = _flatten_robot_state_components(future_robot_state_components, self.args.robot_state_dim)
+                current_instruction = _build_control_prompt(instruction, robot_state_components, self.args)
+                future_instruction = _build_control_prompt(instruction, future_robot_state_components, self.args)
 
                 actions = np.stack(
                     [np.asarray(steps[idx]["action"], dtype=np.float32) for idx in range(step_idx, step_idx + int(self.args.chunk_horizon))],
@@ -638,16 +652,17 @@ class DroidRLDSDataset(IterableDataset):
                 if self.action_mean is not None and self.action_std is not None:
                     actions = (actions - self.action_mean.view(1, -1)) / self.action_std.view(1, -1)
 
-                current_inputs = build_prompt_only_example(self.processor, current_frames, instruction)
-                future_inputs = build_prompt_only_example(self.processor, future_frames, instruction)
+                current_inputs = build_prompt_only_example(self.processor, current_frames, current_instruction)
+                future_inputs = build_prompt_only_example(self.processor, future_frames, future_instruction)
                 emitted += 1
                 yield {
                     "id": sample_id,
                     "task_name": task_name,
-                    "instruction": instruction,
+                    "instruction": current_instruction,
                     "current_inputs": current_inputs,
                     "future_inputs": future_inputs,
-                    "robot_state": robot_state,
+                    "current_robot_state": current_robot_state,
+                    "future_robot_state": future_robot_state,
                     "actions": actions,
                 }
 
@@ -677,7 +692,8 @@ def collate_droid_batch(batch):
         "instructions": [item["instruction"] for item in batch],
         "current_inputs": _stack_inputs([item["current_inputs"] for item in batch]),
         "future_inputs": _stack_inputs([item["future_inputs"] for item in batch]),
-        "robot_state": torch.stack([item["robot_state"] for item in batch], dim=0),
+        "current_robot_state": torch.stack([item["current_robot_state"] for item in batch], dim=0),
+        "future_robot_state": torch.stack([item["future_robot_state"] for item in batch], dim=0),
         "actions": torch.stack([item["actions"] for item in batch], dim=0),
     }
 

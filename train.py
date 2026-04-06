@@ -312,14 +312,16 @@ def run_epoch(model, loader, optimizer, accelerator, args, train: bool, global_s
             for key, value in batch["future_inputs"].items()
         }
         actions = batch["actions"].to(accelerator.device)
-        robot_state = batch["robot_state"].to(accelerator.device)
+        current_robot_state = batch["current_robot_state"].to(accelerator.device)
+        future_robot_state = batch["future_robot_state"].to(accelerator.device)
 
         with accelerator.accumulate(model):
             with torch.set_grad_enabled(train):
                 outputs = model(
                     current_inputs=current_inputs,
                     future_inputs=future_inputs,
-                    robot_state=robot_state,
+                    robot_state=current_robot_state,
+                    future_robot_state=future_robot_state,
                     actions=actions,
                     inject_layer_idx=args.inject_layer_idx,
                     num_future_samples=args.num_future_samples,
