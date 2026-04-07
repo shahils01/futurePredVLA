@@ -8,6 +8,7 @@ MEDIA_ROOT="${MEDIA_ROOT:-}"
 DATA_ROOT="${DATA_ROOT:-}"
 SAVE_DIR="${SAVE_DIR:-checkpoints_future_pred_vla}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXTRA_ARGS="${*:-}"
 
 NNODES="${NNODES:-${SLURM_NNODES:-5}}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
@@ -98,7 +99,7 @@ torchrun \
     --save_dir "$SAVE_DIR" \
     ${GRADIENT_CHECKPOINTING_FLAG:---gradient_checkpointing} \
     ${DDP_UNUSED_FLAG:---ddp_find_unused_parameters} \
-    "$@"
+    ${EXTRA_ARGS}
 EOF
 )
 
